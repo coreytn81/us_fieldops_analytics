@@ -34,7 +34,7 @@ WITH
                         else h.staffing_group end) = l.original_activity_name
                   AND l.month = coalesce(NULLIF('{{month}}',''),t.target_month)
 
-	    WHERE
+        WHERE
             TRUE
             -- AND comm_ops_type = 'COE'
             AND h.time_type = 'Available for Work: On Queue'
@@ -791,7 +791,8 @@ churn_conversion_database AS (
         JOIN northam_ops no
             ON su.email = no.agent_email
         JOIN commops_ai.dim_eats_salesforce_case esc ON ch.case_id = esc.ticket_uuid
-            AND esc.level_5_code = 'Provided Resolution'
+         AND (esc.level_5_code = 'Provided Resolution' AND 
+        (esc.level_6_code IS NULL OR esc.level_6_code != 'Change of Ownership'))
         LEFT JOIN eats_salesops.salesforce_account sa ON esc.account_id = COALESCE(sa.acc_id, sa.acc_parentid)
         LEFT JOIN eds.fact_eats_trip fet ON COALESCE(esc.requester_uuid, sa.acc_rest_uuid) = fet.restaurant_uuid
             AND CAST(fet.datestr AS TIMESTAMP) >= DATE('{{start_date}}') - INTERVAL '1' MONTH
@@ -1110,9 +1111,9 @@ UNION ALL
         qa.datestamp,
         qa.agent_sc_score AS qa_score,
         qa.qa_ticket
-        	
+            
         FROM (
-              SELECT DISTINCT SUBSTRING(SPLIT(ticket_link, '/')[CARDINALITY(SPLIT(ticket_link, '/'))], 1, STRPOS(SPLIT(ticket_link, '/')[CARDINALITY(SPLIT(ticket_link, '/'))], ')') - 1) AS qa_ticket,	
+              SELECT DISTINCT SUBSTRING(SPLIT(ticket_link, '/')[CARDINALITY(SPLIT(ticket_link, '/'))], 1, STRPOS(SPLIT(ticket_link, '/')[CARDINALITY(SPLIT(ticket_link, '/'))], ')') - 1) AS qa_ticket, 
               CAST(review_week AS TIMESTAMP) AS datestamp,
               agent_email,
               agent_sc_score
@@ -1120,10 +1121,10 @@ UNION ALL
               FROM commops.coe_global_spotcheck_qa qa
               
               WHERE TRUE
-              AND CAST(review_date AS TIMESTAMP) BETWEEN CAST('{{start_date}}' AS TIMESTAMP) AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)	
-              AND site_code IN('COE_UBR_CHI','COE_UBR_PHX','COE_UBR_NSH')	
+              AND CAST(review_date AS TIMESTAMP) BETWEEN CAST('{{start_date}}' AS TIMESTAMP) AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP) 
+              AND site_code IN('COE_UBR_CHI','COE_UBR_PHX','COE_UBR_NSH')   
              ) qa
-    	
+        
 UNION ALL
     
     SELECT -- non-standard QA sources: https://docs.google.com/spreadsheets/d/1ZZHDkaVBPxnPF-cvbUtYwAkuf-Jns8-mfyozfwh5Qak/edit#gid=0
@@ -1431,7 +1432,7 @@ SELECT DISTINCT
         LEFT JOIN northam_workday w ON  o.agent_email = w.agent_email
             AND o.datestamp = w.datestamp
             AND o.line_of_business = w.line_of_business
-        LEFT JOIN kirby_external_data.p4p_usc_coe_targets n ON o.line_of_business = n.line_of_business	
+        LEFT JOIN kirby_external_data.p4p_usc_coe_targets n ON o.line_of_business = n.line_of_business  
             AND (
                 ('{{month}}' <> '' and DATE(n.target_month) = DATE(NULLIF('{{month}}','')))
                 or
