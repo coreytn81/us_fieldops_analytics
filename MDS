@@ -1,0 +1,1484 @@
+SET SESSION hash_partition_count = 64;
+WITH
+    
+    scorecard_dates as (
+    SELECT DISTINCT
+        target_month
+        ,scorecard_month_start
+        ,scorecard_month_end
+    from kirby_external_data.p4p_usc_coe_targets
+    ),
+    
+    northam_workday_database AS (
+        SELECT DISTINCT
+              b.uuid AS agent_uuid
+             ,h.email AS agent_email
+             ,case when h.staffing_group = 'Delivery Experience' then 'Delivery Experience'
+                   when l.line_of_business_mapped = 'Non-MDS_Merchant Premium Support' then 'Merchant Premium Support'
+                   when h.staffing_group = 'UET Churn Inbound' then 'UET Churn Inbound'
+                   when h.staffing_group = 'UET Churn Outbound' then 'UET Churn Outbound'
+                   when h.staffing_group = 'UET: FasTrack' then 'UET: FasTrack'
+                   when h.staffing_group in ('Merchant Proactive Support','Merchant Proactive Support (inactive)','Merchant Snowball') then 'Merchant Snowball'
+                else l.line_of_business_mapped end AS line_of_business
+             ,h.time_in AS hours_start
+             ,h.time_out AS hours_end
+             ,h.units
+             
+        FROM secure_brain_sharing.workday_time_tracking_data h
+            LEFT JOIN customer_obsession.dim_bliss_agent b
+                ON LOWER(h.email) = LOWER(b.email)
+           left join scorecard_dates t on h.time_in BETWEEN DATE(t.scorecard_month_start) AND CAST(concat(t.scorecard_month_end,' 23:59:59') AS TIMESTAMP)
+            LEFT JOIN commops.global_lob_mapping l
+                ON (case 
+                        WHEN h.staffing_group LIKE '% %' OR h.staffing_group LIKE '%Â%' THEN REPLACE(REPLACE(h.staffing_group,'â',' '),' ',' ')
+                        else h.staffing_group end) = l.original_activity_name
+                  AND l.month = coalesce(NULLIF('{{month}}',''),t.target_month)
+
+	    WHERE
+            TRUE
+            -- AND comm_ops_type = 'COE'
+            AND h.time_type = 'Available for Work: On Queue'
+            AND h.time_in BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+            AND h.staffing_group IS NOT NULL    
+            AND h.email LIKE '%@uber.com'
+            AND (l.region = 'US&C' or h.staffing_group in('Delivery Experience', 'UET Churn Inbound','UET Churn Outbound'))
+            AND (l.line_of_business_mapped NOT LIKE 'Non-MDS_%' or h.staffing_group in ('UET: FasTrack','Delivery Experience', 'UET Churn Inbound','UET Churn Outbound','Merchant Premium Support'))
+            and (l.line_of_business_mapped != 'Consumer Escalations' and l.line_of_business_mapped != 'Eater Experience' or l.line_of_business_mapped is null)
+    ),
+    
+    northam_workday AS (
+    
+        SELECT
+             DATE_TRUNC('{{time_interval}}', hours_start) AS datestamp
+            ,line_of_business
+            ,agent_uuid
+            ,agent_email
+        --    ,min(DATE_TRUNC('{{time_interval}}', hours_start)) OVER(PARTITION BY line_of_business) as first_mds_week
+            ,SUM(units) AS productive_hours
+    
+        FROM
+            northam_workday_database
+    
+        GROUP BY
+            1, 2, 3, 4 
+    ),
+
+    northam_ops AS (
+    
+        SELECT DISTINCT 
+             agent_email
+            ,line_of_business
+            ,date_id AS datestamp
+        
+        FROM northam_workday
+            CROSS JOIN (
+                SELECT DISTINCT DATE_TRUNC('{{time_interval}}', date_id) AS date_id
+                FROM dwh.dim_date
+                WHERE date_id BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+            ) AS d(date_id)
+  --     where date_id >= first_mds_week
+    ),
+
+    northam_full AS (
+    
+        SELECT DISTINCT
+             o.datestamp
+            ,o.agent_email
+            ,COALESCE(r.employee_name,CONCAT(a.first_name,' ',a.last_name)) AS agent_name
+            ,COALESCE(r.manager1_email,t.work_email) AS team_lead_email
+            ,COALESCE(r.manager1_name,CONCAT(t.first_name,' ',t.last_name)) AS team_lead_name
+            ,COALESCE(r.manager2_email,m.work_email) AS manager_email
+            ,COALESCE(r.manager2_name,CONCAT(m.first_name,' ',m.last_name)) AS manager_name
+            ,o.line_of_business
+            ,r.site_code
+
+        FROM northam_ops o
+        LEFT JOIN commops.coe_roster_snapshot r
+                ON LOWER(o.agent_email) = LOWER(r.work_email)
+                AND CAST(r.week AS DATE) = DATE_TRUNC('week', o.datestamp)
+        LEFT JOIN whober.qb_employees_view a ON a.work_email = o.agent_email 
+        LEFT JOIN whober.qb_employees_view t ON t.employee_id = a.manager_id
+        LEFT JOIN whober.qb_employees_view m ON m.employee_id = t.manager_id
+            
+        --  WHERE
+        --     TRUE
+        --     AND r.site_code IN ('COE_UBR_CHI','COE_UBR_PHX') -- commented out to ensure remote workers are included
+    ),
+    
+    bliss_app_solves_database AS (
+
+        SELECT DISTINCT
+             CAST(DATE_FORMAT(DATE_TRUNC('{{time_interval}}', b.close_timestamp), '%Y-%m-%d %H:%i:%s') AS TIMESTAMP) AS datestamp
+            ,b.close_agent_uuid AS agent_uuid
+            ,a.email AS agent_email
+            ,b.uuid
+            ,case when o.line_of_business in('Consumer Escalations','Driver Messaging Escalations') then
+                case when lower(t.ancestor_1_name) like '%driver%' or lower(t.ancestor_1_name) like '%delivery partner%' 
+                            or SUBSTR(b.latest_queues, 3, 36) in(
+                                    '17b8d680-dc29-4f11-917f-dd37a57be78e',
+                                    'b6121c27-b1e4-488b-b048-d4f16db0b0f8',
+                                    '2a0ef151-7799-4cc8-9282-8cce4d434218',
+                                    '70350a07-f03d-4d5a-8ba7-2ebfcd384e2f'
+                                )
+                        then 'Driver Messaging Escalations'
+                    when lower(t.ancestor_1_name) like '%rider%' or lower(t.ancestor_1_name) like '%eater%'
+                            or SUBSTR(b.latest_queues, 3, 36) in( 
+                                    'b7c302fc-0478-4ae4-9b72-a4e256313f0a',
+                                    '327757eb-7b05-4f45-8b95-a73baccd959e',
+                                    '285f3135-718d-46c6-822a-50af8445da86'
+                            )
+                        then 'Consumer Escalations'
+                    end
+                end as line_of_business
+            -- ,CAST(s.survey_response AS BIGINT) as csat_rating
+            ,n.csat_rating
+        
+        FROM
+            dwh.dim_bliss_ticket b
+            JOIN customer_obsession.dim_bliss_agent a ON b.close_agent_uuid = a.uuid
+            -- left join northam_ops o on o.agent_email = a.email and o.datestamp = CAST(DATE_FORMAT(DATE_TRUNC('{{time_interval}}', b.close_timestamp), '%Y-%m-%d %H:%i:%s') AS TIMESTAMP)
+            left join (select email as agent_email, date_trunc('{{time_interval}}', time_in) as datestamp, staffing_group as line_of_business from secure_brain_sharing.workday_time_tracking_data where time_type IN('Available for Work: On Queue')
+                AND time_in BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+                AND staffing_group IS NOT NULL ) o
+                on o.agent_email = a.email and o.datestamp = CAST(DATE_FORMAT(DATE_TRUNC('{{time_interval}}', b.close_timestamp), '%Y-%m-%d %H:%i:%s') AS TIMESTAMP)
+        --     LEFT JOIN (SELECT DISTINCT contact_uuid  -- 1 to 1 join; this join is used to filter out Phone contacts that are changed to messaging but do not have messages.
+        --     FROM customer_obsession.fact_bliss_phone 
+        --     WHERE TRUE 
+        --     AND conversation_start_timestamp_utc BETWEEN (CAST('{{start_date}}'as TIMESTAMP) - INTERVAL '7' DAY) AND CAST('{{end_date}} 23:59:59'as TIMESTAMP) -- pulling all calls from at least 1 week prior to the contact
+        --     AND CAST(datestr AS TIMESTAMP) >= CAST('{{start_date}}' AS TIMESTAMP) - INTERVAL '7' DAY
+        --     AND CAST(datestr AS TIMESTAMP) <= CAST('{{end_date}}'as TIMESTAMP) + INTERVAL '7' day
+        --     ) fbp
+        -- ON b.uuid = fbp.contact_uuid 
+            LEFT JOIN customer_obsession.dim_bliss_ticket_type t ON b.type_uuid = t.uuid
+            LEFT JOIN customer_obsession.analytics_bliss_ticket n ON b.uuid = n.ticket_uuid
+            -- left join customer_obsession.dim_bliss_queue q on SUBSTR(b.latest_queues, 3, 36) = q.uuid
+            -- LEFT JOIN customer_obsession.fact_bliss_survey s ON b.uuid = s.ticket_uuid
+            --     and b.close_agent_uuid = s.survey_agent_uuid
+            --     and survey_response in('1','2','3','4','5')
+            --     and s.datestr is not null
+        
+        WHERE
+            TRUE
+            AND b.close_timestamp BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+            AND b.status IN('archived','solved','response_requested')
+            AND b.modality in('messaging','chat')
+            and (case when b.city_id not in(592,1526,1527) or b.city_id is null then b.country_code end) in('US','CA')
+            AND (t.group_uuid != '4cbe09e6-bf80-48ce-9990-562d71ea4459' OR t.group_uuid IS NULL)
+            AND (b.status = 'open' OR n.count_agent_messages > 0 OR n.count_agent_messages IS NULL) -- exclude closed tickets without an agent response i.e. Spam
+            AND (b.type_uuid != '2a50d9f2-10d8-4677-b4a4-eab571cb67f4' OR b.type_uuid IS NULL) -- exclude Internal Unroutable Contacts -- Added Aug 18 2020
+            AND (b.is_csr_ticket = FALSE OR (b.is_csr_ticket = TRUE AND n.count_agent_messages > 0 AND n.count_user_messages > 0)) 
+            AND a.site_code IN('COE_UBR_CHI','COE_UBR_PHX','COE_UBR_NSH')
+            AND a.email LIKE '%@uber.com'
+            AND a.status = 'active'
+            AND (b.is_test_ticket = FALSE OR b.is_test_ticket IS NULL) -- exclude flagged test contacts
+            AND (t.group_uuid != '7bf34628-726b-4e66-b876-9c55c2b9c032' OR t.group_uuid IS NULL) -- exclude OTT Internal contacts
+            AND (a.site_code != 'OPS_BOT_AGENTS' OR a.site_code IS NULL) -- exclude bot solved tickets
+            
+    ), 
+    
+    bliss_handle_time as(
+        select 
+            ht.agent_uuid,
+            a.email as agent_email,
+            date_trunc('{{time_interval}}', ht.lp_start_timestamp) as datestamp,
+            sum(ht.net_handle_time)/60.0 as handle_time_mins
+        from 
+            customer_obsession.analytics_bliss_handle_time ht
+            join customer_obsession.dim_bliss_agent a 
+                on a.uuid = ht.agent_uuid
+            -- join northam_workday_database w 
+            --     on w.agent_uuid = ht.agent_uuid
+            --     and ht.lp_start_timestamp >= w.hours_start
+            --     and ht.lp_end_timestamp <= w.hours_end
+        where 
+            datestr is not null
+            AND DATE(ht.lp_start_timestamp) BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+        group by 1,2,3
+    ),
+            
+    bliss_app_solves_agg AS (        
+            SELECT DISTINCT
+             b.datestamp
+            ,b.agent_uuid
+            ,b.agent_email
+            ,line_of_business
+            ,COUNT(b.uuid) AS bliss_solves
+            ,SUM(CASE WHEN b.csat_rating IS NOT NULL THEN CAST(b.csat_rating AS DOUBLE) ELSE 0 END) AS bliss_app_stars
+            ,COUNT(CASE WHEN CAST(b.csat_rating AS DOUBLE) = 1 THEN b.uuid END) AS bliss_app_1_star
+            ,COUNT(CASE WHEN CAST(b.csat_rating AS DOUBLE) = 5 THEN b.uuid END) AS bliss_app_5_star
+            ,COUNT(CASE WHEN b.csat_rating IS NOT NULL THEN b.uuid END) AS bliss_app_surveys
+        FROM
+            bliss_app_solves_database b
+        GROUP BY
+            1, 2, 3, 4
+    ),
+    
+    bliss_app_actions AS (
+        SELECT DISTINCT
+             CAST(DATE_FORMAT(DATE_TRUNC('{{time_interval}}', DATE(f.action_timestamp)), '%Y-%m-%d %H:%i:%s') AS TIMESTAMP) AS datestamp
+            ,f.initiator_uuid AS agent_uuid
+            ,a.email AS agent_email
+            ,f.ticket_uuid
+             ,case when o.line_of_business in('Consumer Escalations','Driver Messaging Escalations') then
+                    case when lower(t.ancestor_1_name) like '%driver%' or lower(t.ancestor_1_name) like '%delivery partner%' 
+                            or SUBSTR(b.latest_queues, 3, 36) in(
+                                    '17b8d680-dc29-4f11-917f-dd37a57be78e',
+                                    'b6121c27-b1e4-488b-b048-d4f16db0b0f8',
+                                    '2a0ef151-7799-4cc8-9282-8cce4d434218',
+                                    '70350a07-f03d-4d5a-8ba7-2ebfcd384e2f'
+                                )
+                        then 'Driver Messaging Escalations'
+                    when lower(t.ancestor_1_name) like '%rider%' or lower(t.ancestor_1_name) like '%eater%'
+                            or SUBSTR(b.latest_queues, 3, 36) in( 
+                                    'b7c302fc-0478-4ae4-9b72-a4e256313f0a',
+                                    '327757eb-7b05-4f45-8b95-a73baccd959e',
+                                    '285f3135-718d-46c6-822a-50af8445da86'
+                            )
+                        then 'Consumer Escalations'
+                    end
+                end as line_of_business
+            ,REGEXP_LIKE(CONCAT(coalesce(lower(t.ancestor_1_name),''),coalesce(lower(t.ancestor_2_name),''), coalesce(lower(t.ancestor_3_name),''),coalesce(lower(t.ancestor_4_name),''),coalesce(lower(t.ancestor_5_name),''),coalesce(lower(t.ancestor_6_name),''),coalesce(lower(t.ancestor_7_name),'')), 'duplicate contact') as dupe_flag
+            ,COUNT(DISTINCT(CASE WHEN f.type = 'update_status' AND f.value IN ('solved','response_requested') THEN f.uuid ELSE NULL END)) AS bliss_actions
+            ,COUNT(DISTINCT(CASE WHEN f.value IN ('solved') THEN b.uuid ELSE NULL END)) AS distinct_solve_attempts -- get distinct tickets agents clicked solve on for fcr denominator
+            ,COUNT(DISTINCT(CASE
+                                 WHEN type = 'message' AND t.ancestor_4_name = 'Alleged food tampering' THEN NULL -- removing messages from "Food Tampering" issue types as part of a Safety Workflow change - CSP4P-13138
+                                 WHEN type IN ('update_status','message','addPartnerMiscPaymentV3') THEN CONCAT(f.type,f.ticket_uuid)
+                                 WHEN t.ancestor_4_name = 'Alleged food tampering' AND type IN ('updateStatusLocksWithTranslationParamsV1','changeDriverStatusV1','updateUserSafetyLockV1','partner_note','unbanClientV1','unbanDeviceV1') THEN CONCAT(f.type,f.ticket_uuid)
+                                 WHEN t.ancestor_3_name = 'Self-Harm' AND type IN ('updateStatusLocksWithTranslationParamsV1','changeDriverStatusV1','updateUserSafetyLockV1','partner_note','unbanClientV1','unbanDeviceV1') THEN CONCAT(f.type,f.ticket_uuid)
+                                 WHEN t.ancestor_3_name = 'Threat of Violence with Weapon or Object' AND type IN ('updateStatusLocksWithTranslationParamsV1','changeDriverStatusV1','updateUserSafetyLockV1','partner_note','unbanClientV1','unbanDeviceV1','updateVehicleActivationV1') THEN CONCAT(f.type,f.ticket_uuid)
+                                 WHEN t.ancestor_3_name = 'Health' AND type IN ('updateStatusLocksWithTranslationParamsV1','changeDriverStatusV1','updateUserSafetyLockV1','partner_note','unbanClientV1','unbanDeviceV1','uploadDocumentV2') THEN CONCAT(f.type,f.ticket_uuid)
+                                 WHEN t.ancestor_2_name IN ('Potential Safety Concern','Theft or Robbery','Sexual Misconduct','Sexual Assault','Physical Altercation') AND type IN ('updateStatusLocksWithTranslationParamsV1','changeDriverStatusV1','updateUserSafetyLockV1','partner_note','unbanClientV1','unbanDeviceV1') THEN CONCAT(f.type,f.ticket_uuid)
+                                 WHEN t.ancestor_2_name = 'Vehicle Crash or Claim' and t.ancestor_4_name in('Life-Altering Injuries Alleged','Fatality','Life altering injuries alleged') AND f.type IN ('updateStatusLocksWithTranslationParamsV1','changeDriverStatusV1','updateUserSafetyLockV1','partner_note','unbanClientV1','unbanDeviceV1','updateVehicleActivationV1') THEN CONCAT(f.type,f.ticket_uuid)
+                                 WHEN t.ancestor_2_name = 'Vehicle Crash or Claim' and t.ancestor_4_name not in('Life-Altering Injuries Alleged','Fatality','Life altering injuries alleged') AND f.type IN ('updateStatusLocksWithTranslationParamsV1','partner_note','unbanClientV1','unbanDeviceV1','updateVehicleActivationV1') THEN CONCAT(f.type,f.ticket_uuid)
+                                 WHEN t.ancestor_3_name = 'L3 Investigations' AND type IN ('updateStatusLocksWithTranslationParamsV1','changeDriverStatusV1','updateUserSafetyLockV1','partner_note','unbanClientV1','unbanDeviceV1','uploadDocumentV2','addUserTagV1','deleteUserTagV1') THEN CONCAT(f.type,f.ticket_uuid) -- added on 03/01/2022
+                                 WHEN t.ancestor_3_name = 'L4 Investigations' AND type IN ('updateStatusLocksWithTranslationParamsV1','changeDriverStatusV1','updateUserSafetyLockV1','partner_note','unbanClientV1','unbanDeviceV1','uploadDocumentV2','addUserTagV1','deleteUserTagV1') THEN CONCAT(f.type,f.ticket_uuid) -- added on 03/01/2022
+            ELSE NULL END)) AS bliss_triage_actions -- using distinct concat on type + ticket UUID means the actions will be counted per ticket but capped at once per action per ticket
+            ,count(distinct(case when type in('updateUserSafetyLockV1','updateStatusLocksWithTranslationParamsV1','changeDriverStatusV1') then f.type end)) as bliss_tsi_actions
+            ,least(count(distinct(case when type = 'message' then f.uuid end)),
+                case when REGEXP_LIKE(CONCAT(coalesce(lower(t.ancestor_1_name),''),coalesce(lower(t.ancestor_2_name),''), coalesce(lower(t.ancestor_3_name),''),coalesce(lower(t.ancestor_4_name),''),coalesce(lower(t.ancestor_5_name),''),coalesce(lower(t.ancestor_6_name),''),coalesce(lower(t.ancestor_7_name),'')), 'duplicate contact') 
+                    then 1 else 3 end)
+                as bliss_tsi_messages
+            
+        FROM
+            customer_obsession.fact_bliss_action f
+            JOIN customer_obsession.dim_bliss_agent a ON f.initiator_uuid = a.uuid
+            JOIN dwh.dim_bliss_ticket b ON f.ticket_uuid = b.uuid
+            -- left join northam_ops o on o.agent_email = a.email and o.datestamp = CAST(DATE_FORMAT(DATE_TRUNC('{{time_interval}}', DATE(f.action_timestamp)), '%Y-%m-%d %H:%i:%s') AS TIMESTAMP)
+            left join (select email as agent_email, date_trunc('{{time_interval}}', time_in) as datestamp, staffing_group as line_of_business from secure_brain_sharing.workday_time_tracking_data where time_type IN('Available for Work: On Queue')
+                AND time_in BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+                AND staffing_group IS NOT NULL ) o
+                on o.agent_email = a.email and o.datestamp = CAST(DATE_FORMAT(DATE_TRUNC('{{time_interval}}', f.action_timestamp), '%Y-%m-%d %H:%i:%s') AS TIMESTAMP)
+            LEFT JOIN customer_obsession.dim_bliss_ticket_type t ON b.type_uuid = t.uuid
+            LEFT JOIN customer_obsession.analytics_bliss_ticket a ON b.uuid = a.ticket_uuid
+      
+        WHERE
+            TRUE
+            AND CAST(DATE_FORMAT(f.action_timestamp,'%Y-%m-%d %H:%i:%S') AS TIMESTAMP) BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+            AND CAST(f.datestr as DATE) >= CAST('{{start_date}}' AS DATE) - INTERVAL '7' DAY 
+            AND LOWER(f.initiator_type) = 'agent'
+            AND b.modality in('messaging','chat')
+            and (case when b.city_id not in(592,1526,1527) or b.city_id is null then b.country_code end) in('US','CA')
+            AND (t.group_uuid != '4cbe09e6-bf80-48ce-9990-562d71ea4459' OR t.group_uuid IS NULL)
+            -- AND (b.status = 'open' OR a.count_agent_messages > 0 OR a.count_agent_messages IS NULL) -- exclude closed tickets without an agent response i.e. Spam -- removed 5/30/2023 for Safety Team APH
+            AND (b.type_uuid != '2a50d9f2-10d8-4677-b4a4-eab571cb67f4' OR b.type_uuid IS NULL) -- exclude Internal Unroutable Contacts -- Added Aug 18 2020
+            
+            -- AND (b.is_csr_ticket = FALSE OR (b.is_csr_ticket = TRUE AND count_agent_messages > 0 AND count_user_messages > 0)) -- removed 5/30/2023 for Safety Team APH
+            AND a.site_code IN('COE_UBR_CHI','COE_UBR_PHX','COE_UBR_NSH')
+            AND a.email LIKE '%@uber.com'
+            AND a.status = 'active'
+            AND (b.is_test_ticket = FALSE OR b.is_test_ticket IS NULL) -- exclude flagged test contacts
+            AND (t.group_uuid != '7bf34628-726b-4e66-b876-9c55c2b9c032' OR t.group_uuid IS NULL) -- exclude OTT Internal contacts
+            AND (a.site_code != 'OPS_BOT_AGENTS' OR a.site_code IS NULL) -- exclude bot solved tickets 
+        GROUP BY
+            1, 2, 3, 4, 5, 6
+     ),
+    
+    bliss_app_actions_agg AS (
+    
+        SELECT DISTINCT
+             datestamp
+            ,agent_uuid
+            ,agent_email
+            ,line_of_business
+            ,SUM(bliss_actions) AS bliss_actions
+            ,SUM(bliss_triage_actions) AS bliss_triage_actions
+            ,SUM(distinct_solve_attempts) as distinct_solve_attempts
+            ,sum(bliss_tsi_actions + bliss_tsi_messages) as bliss_tsi_actions
+        FROM
+            bliss_app_actions
+            
+        GROUP BY
+            1, 2, 3, 4
+    ),
+    
+    bliss_phone_database AS (
+
+        SELECT DISTINCT
+             CAST(DATE_FORMAT(FROM_ISO8601_TIMESTAMP(p.segment_start_timestamp_utc),'%Y-%m-%d %H:%i:%S') AS TIMESTAMP) AS segment_start_timestamp_utc
+            ,p.queue_name
+            ,a.email AS agent_email
+            ,p.conversation_id
+            ,p.contact_uuid
+            ,p.session_id
+            ,p.segment_duration_seconds
+            ,p.segment_type            
+
+        FROM
+            customer_obsession.bliss_phone_segment p
+            JOIN customer_obsession.dim_bliss_agent a ON p.agent_uuid = a.uuid
+            
+        WHERE
+            CAST(DATE_FORMAT(FROM_ISO8601_TIMESTAMP(p.conversation_start_timestamp_utc),'%Y-%m-%d %H:%i:%S') AS TIMESTAMP) BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+            AND DATE(p.datestr) >= DATE('{{start_date}}') - INTERVAL '7' DAY
+            AND p.direction = 'inbound'
+            AND p.segment_type IN('interact','hold','wrapup')
+            AND a.site_code IN('COE_UBR_CHI','COE_UBR_PHX','COE_UBR_NSH')
+            AND a.email LIKE '%@uber.com'
+            AND a.status = 'active'            
+            
+    ),
+    
+    bliss_phone_calls AS (
+
+        SELECT
+             DATE_TRUNC('{{time_interval}}', p.segment_start_timestamp_utc) AS datestamp
+            ,p.agent_email
+            ,COUNT(DISTINCT p.conversation_id) AS bliss_phone
+            ,SUM(p.segment_duration_seconds) / 60.0 AS bliss_phone_time
+    
+        FROM
+            bliss_phone_database p
+            
+        GROUP BY
+            1, 2
+            
+    ),
+    
+    bliss_phone_uuid AS (
+    
+        SELECT DISTINCT
+            contact_uuid
+        
+        FROM
+            bliss_phone_database
+    
+    ),
+    
+    bliss_phone_csat AS (
+
+        SELECT
+             DATE_TRUNC('{{time_interval}}', CAST(DATE_FORMAT(b.close_timestamp,'%Y-%m-%d %H:%i:%S') AS TIMESTAMP)) AS datestamp
+            ,a.email AS agent_email
+            ,SUM(CAST(s.survey_response AS BIGINT)) AS bliss_phone_stars
+            ,COUNT(CASE WHEN s.survey_response = '1' THEN CAST(survey_response AS BIGINT) END) AS bliss_phone_1_star
+            ,COUNT(CASE WHEN s.survey_response = '5' THEN CAST(survey_response AS BIGINT) END) AS bliss_phone_5_star
+            ,COUNT(CAST(s.survey_response AS BIGINT)) AS bliss_phone_surveys
+    
+        FROM
+            bliss_phone_uuid p
+            JOIN dwh.dim_bliss_ticket b ON p.contact_uuid = b.uuid
+            JOIN customer_obsession.fact_bliss_survey s on b.uuid = s.ticket_uuid
+            JOIN customer_obsession.dim_bliss_agent a ON s.survey_agent_uuid = a.uuid
+
+        WHERE
+                DATE(s.datestr) >= DATE('{{start_date}}') - INTERVAL '7' DAY
+            AND s.survey_response IN('1','2','3','4','5')
+            AND a.site_code IN('COE_UBR_CHI','COE_UBR_PHX','COE_UBR_NSH')
+            AND a.email LIKE '%@uber.com'
+            AND a.status = 'active'  
+            AND (b.uuid IS NULL OR b.modality = 'phone')
+            AND (b.uuid IS NULL OR NOT b.type_uuid IN('c60c4e9d-26d1-4b56-888c-30bcbc8daeaa',
+                                                      '0419eb33-c5cf-43b7-8e95-1e18c966aa4e',
+                                                      '133933d0-bffc-44f1-bde0-8ed6883066c4',
+                                                      '6d75d144-b3be-4dbd-96db-8cf9bfa21000',
+                                                      'e928535c-0830-420b-bbae-1f302ff4c351',
+                                                      '00ba9e6e-bfba-45e1-8603-0a6267a4d47e',
+                                                      'ed8d90d3-2dfd-41c7-957f-034783835900',
+                                                      'f20b7a2c-cb69-430b-8358-7d16cd705b64',
+                                                      'e0a2303f-5d06-4a90-856a-b5614e9b12a2')) -- exclude Eng Test Contacts
+            
+        GROUP BY
+            1, 2
+            
+    ),
+    
+     safety_jira_database as(
+        -- Case Created (SAFE:Triage)
+        select distinct 
+            j.reporting_agent_email_address as agent_email,
+            date_trunc('{{time_interval}}',j.created_at) as datestamp,
+            'SAFE: Triage' as line_of_business,
+            j.ticket_id as issue_key
+        from 
+            secure_safety.eats_safety_jira_tickets_global_ops j
+            JOIN customer_obsession.dim_bliss_agent a ON j.reporting_agent_email_address = a.email
+        WHERE 
+            TRUE
+            AND j.reporting_agent_email_address LIKE '%@uber.com'
+            AND CAST(created_at AS TIMESTAMP) BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+            AND a.site_code = 'COE_UBR_PHX'
+            AND a.email LIKE '%@uber.com'
+            AND a.status = 'active'
+    union all 
+         select distinct 
+            j.reporting_agent_email_address as agent_email,
+            date_trunc('{{time_interval}}', from_iso8601_timestamp(cast(j.created_at as varchar))) AS datestamp,
+            'SAFE: Triage' as line_of_business,
+            ticket_id as issue_key
+        from 
+            secure_safety.safe_safety_jira_tickets_global_ops j
+            JOIN customer_obsession.dim_bliss_agent a ON j.reporting_agent_email_address = a.email
+        WHERE 
+            TRUE
+            AND j.reporting_agent_email_address LIKE '%@uber.com'
+            AND from_iso8601_timestamp(cast(j.created_at as varchar)) BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+            AND a.site_code = 'COE_UBR_PHX'
+            AND a.email LIKE '%@uber.com'
+            AND a.status = 'active'
+            
+        -- Case Resolved (SAFE:TSI)
+    union all 
+         select distinct 
+            j.assignee_email as agent_email,
+            date_trunc('{{time_interval}}',resolved_at) as datestamp,
+            'SAFE: Resolved' as line_of_business,
+            ticket_id as issue_key
+        from 
+            secure_safety.eats_safety_jira_tickets_global_ops j
+            JOIN customer_obsession.dim_bliss_agent a ON j.assignee_email = a.email
+        WHERE 
+            TRUE
+            AND j.assignee_email LIKE '%@uber.com'
+            AND CAST(resolved_at AS TIMESTAMP) BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+            and lower(j.status) in('done','resolved')
+            AND a.site_code = 'COE_UBR_PHX'
+            AND a.email LIKE '%@uber.com'
+            AND a.status = 'active'
+    union all 
+        select distinct
+            j.assignee_email as agent_email,
+            DATE_TRUNC('{{time_interval}}', from_iso8601_timestamp(cast(j.resolved_at as varchar))) AS datestamp,
+            'SAFE: Resolved' as line_of_business,
+            j.ticket_id AS issue_key
+        from secure_safety.safe_safety_jira_tickets_global_ops j
+                JOIN customer_obsession.dim_bliss_agent a ON j.assignee_email = a.email
+        WHERE TRUE
+            AND FROM_ISO8601_TIMESTAMP(CAST(j.resolved_at AS VARCHAR)) BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+            and lower(j.status) in('done','resolved')
+            AND j.resolved_at <> ''
+            AND a.site_code = 'COE_UBR_PHX'
+                AND a.email LIKE '%@uber.com'
+                AND a.status = 'active'
+    ),
+    
+    safety_jira_agg as(
+        select 
+            agent_email,
+            datestamp,
+            line_of_business,
+            count(issue_key) as jira
+        from 
+            safety_jira_database
+        group by 1,2,3
+            
+    ),
+    
+    jira_database AS (
+-- Main JIRA case resolved (All Non-Safety)
+            
+        SELECT DISTINCT
+             j.assignee AS agent_email
+            ,DATE_FORMAT(DATE_TRUNC('{{time_interval}}', CAST(j.resolved AS TIMESTAMP)), '%Y-%m-%d') AS datestamp
+            ,CASE
+                WHEN j.project = 'BGC' THEN 'BGC: JIRA' 
+                WHEN j.project = 'ECR' THEN 'ECR'
+                WHEN j.project = 'EFT' THEN 'UET: FasTrack'
+                WHEN j.project = 'TAX' THEN 'TAX'
+            
+            --Driver C360 LOBs
+                when  j.project = 'C360R' AND (Lower(t.type_2) = 'driver' and Lower(t.type_3) in ('account','nyc tlc','signing up','vehicle solutions & financing','govt portal', 'background check','tech issues')  ) then 'Driver Account'
+                when  j.project = 'C360R' AND (Lower(t.type_2) = 'driver' and Lower(t.type_3) in ('payment','wage garnishments','dost')  ) then 'Driver Payment'
+                when  j.project = 'C360R' AND (Lower(t.type_2) = 'driver' and Lower(t.type_3) in ('citations','info','trips')  ) then 'Driver Trips'
+                when  j.project = 'C360R' AND (Lower(t.type_2) = 'driver' and Lower(t.type_3) in ('activations & docs')  ) then 'Docs'
+                when  j.project = 'C360R' AND (Lower(t.type_2) = 'driver' and Lower(t.type_3) in ('uberpro')  ) then 'Loyalty'
+                when  j.project = 'C360R' AND (Lower(t.type_2) = 'delivery partner' and Lower(t.type_3) in ('active account settings','bank deposits and taxes', 'pickups and deliveries','promotions','referrals','signing up')  ) then 'Delivery Partner'
+              --Rider C360 LOBs
+                when  j.project = 'C360R' AND (Lower(t.type_2) = 'rider' and Lower(t.type_3) in ('account & payment', 'info','tech issues')  ) then 'Rider Account & Payment'
+                when  j.project = 'C360R' AND (Lower(t.type_2) = 'rider' and Lower(t.type_3) in ('fare review','feedback about driver and vehicle','pickup and drop-off', 'trips')  ) then 'Rider Trips'
+                when  j.project = 'C360R' AND (Lower(t.type_2) in ('driver', 'rider') and Lower(t.type_3) in ('driver asr','asr')  ) then 'ASR'
+                when  j.project = 'C360R' AND (Lower(t.type_2) in ('driver', 'rider') and Lower(t.type_3) in ('cleaning fee','lost items')  ) then 'Recovery'
+                when  j.project = 'C360R' AND (Lower(t.type_2) in ('rider','eater') and Lower(t.type_3) in ('uberrewards')  ) then 'Loyalty'
+                when  j.project = 'C360R' AND (Lower(t.type_2) = 'eater' and Lower(t.type_3) in ('account and profile settings','billing and payment methods','orders','promotions and referrals')  ) then 'Eater'
+ 
+                ELSE project||' '||j.status||' (Unassigned)' END AS line_of_business
+            ,COALESCE(t.type_2,'') || COALESCE(' > ' || t.type_3,'') AS jira_type
+            ,j.key AS issue_key
+            ,CASE WHEN j.csat IN ('1.0','2.0','3.0','4.0','5.0') THEN 1
+             ELSE 0 END AS jira_csat_replies
+            ,CASE
+                WHEN j.csat= '5.0' THEN 5
+                WHEN j.csat= '4.0' THEN 4
+                WHEN j.csat= '3.0' THEN 3
+                WHEN j.csat= '2.0' THEN 2
+                WHEN j.csat= '1.0' THEN 1
+                ELSE 0 END AS jira_csat
+            ,CASE WHEN s.survey_agent_uuid = a.uuid THEN CAST(s.survey_response AS INT) END AS survey_stars
+            ,COUNT(CASE WHEN project = 'C360R' AND  a.uuid = a.initiator_uuid THEN a.email END) AS count_agent_replies
+            ,COUNT(CASE WHEN project = 'C360R' THEN a.email END) AS count_total_replies
+            
+        FROM commops_ai.dim_jira_cases j
+            JOIN customer_obsession.dim_bliss_agent a ON j.assignee = a.email
+            LEFT JOIN commops_ai.dim_jira_cases_type t ON j.type_uuid = t.type_uuid
+            LEFT JOIN (SELECT key, field, FIRST_VALUE(action_ts) OVER(PARTITION BY key ORDER BY action_ts) AS first_action_timestamp FROM commops_ai.fact_jira_actions WHERE field = 'assignee' AND project > '1') h ON j.key = h.key
+            LEFT JOIN (SELECT action_timestamp, ticket_uuid, initiator_uuid FROM customer_obsession.fact_bliss_action WHERE DATE(datestr) >= DATE('{{start_date}}') - INTERVAL '7' DAY AND type = 'update_status') a ON REGEXP_EXTRACT(j.contact,'[0-9A-Za-z]{8}-[0-9A-Za-z]{4}-[0-9A-Za-z]{4}-[0-9A-Za-z]{4}-[0-9A-Za-z]{12}') = a.ticket_uuid
+            AND a.action_timestamp >= h.first_action_timestamp
+            LEFT JOIN (SELECT DISTINCT ticket_uuid, survey_agent_uuid, FIRST_VALUE(survey_response) OVER (PARTITION BY ticket_uuid ORDER BY survey_response_timestamp DESC) AS survey_response FROM customer_obsession.fact_bliss_survey WHERE DATE(datestr) >= DATE('{{start_date}}') - INTERVAL '7' DAY AND survey_response IN('1','2','3','4','5')) s ON REGEXP_EXTRACT(j.contact,'[0-9A-Za-z]{8}-[0-9A-Za-z]{4}-[0-9A-Za-z]{4}-[0-9A-Za-z]{4}-[0-9A-Za-z]{12}') = s.ticket_uuid
+                
+        WHERE
+            TRUE
+            AND project IN ('ECR','C360','BGC','C360R','EFT','TAX')
+            AND j.assignee LIKE '%@uber.com'
+            AND j.status IN ('Completed','Done','Resolved')
+            AND CAST(j.resolved AS TIMESTAMP) BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+            AND a.site_code IN('COE_UBR_CHI','COE_UBR_PHX','COE_UBR_NSH')
+            AND a.email LIKE '%@uber.com'
+            AND a.status = 'active'
+            AND NOT (j.project = 'EFT' AND j.resolution = 'Rejected')
+            
+        GROUP BY
+            1, 2, 3, 4, 5, 6, 7, 8
+    ),
+
+    jira AS (
+
+        SELECT
+             agent_email
+            ,DATE(datestamp) AS datestamp
+            ,Case when line_of_business in ('Driver Account','Driver Payment','Driver Trips','Docs','Delivery Partner','TAX') or jira_type = 'Driver > UberPro' then 'Driver C360' 
+              when line_of_business in ('Rider Account & Payment', 'Rider Trips','ASR', 'Recovery','Eater') or jira_type in ('Rider > UberRewards', 'Eater > UberRewards') then 'Rider C360'
+              else line_of_business end as line_of_business
+            ,COUNT(DISTINCT issue_key) AS jira
+            ,SUM(survey_stars) AS bliss_jira_stars -- Bliss CSAT Scores
+            ,COUNT(survey_stars) AS bliss_jira_surveys -- Bliss CSAT Survey Responses
+            ,COUNT(CASE WHEN survey_stars = 1 THEN survey_stars END) AS bliss_jira_1_star -- Bliss 1-Star CSAT
+            ,SUM(jira_csat) AS jira_stars -- JIRA CSAT Scores
+            ,SUM(jira_csat_replies) AS jira_surveys -- JIRA Survey Responses
+            ,COUNT(CASE WHEN jira_csat = 1 THEN jira_csat END) AS jira_1_star -- Bliss 1-Star CSAT
+            -- ,COUNT(DISTINCT CASE WHEN count_agent_replies = 1 AND count_total_replies = 1 THEN issue_key END) AS jira_fcr
+            
+        FROM
+            jira_database
+        
+        GROUP BY
+            1, 2, 3
+    ),
+    
+fast_track_comments_agg AS (
+
+    SELECT
+    
+        datestamp,
+        agent_email,
+        SUM(comments) AS comments
+        
+    FROM (
+          SELECT
+    
+            DATE_TRUNC('{{time_interval}}',j.action_ts) AS datestamp,
+            j.email AS agent_email,
+            COUNT(*) AS comments
+
+         FROM (
+              SELECT DISTINCT
+                 j.key
+                ,j.email
+                ,j.action_ts
+                ,j.new_val
+                
+              FROM commops_ai.fact_jira_actions j
+              JOIN commops_ai.dim_jira_cases jc
+                ON jc.key = j.key
+              INNER JOIN northam_full w
+                ON w.agent_email = j.email
+                AND TO_CHAR(DATE_TRUNC('{{time_interval}}',w.datestamp), 'yyyy-mm-dd') = TO_CHAR(DATE_TRUNC('{{time_interval}}',j.action_ts), 'yyyy-mm-dd')
+                
+            WHERE TRUE
+            AND j.project = 'EFT'
+            AND jc.project = 'EFT'
+            AND j.field = 'comment'
+            AND DATE(j.action_ts AT TIME ZONE 'America/Chicago') >= DATE(IF('{{start_date}}'='', TO_CHAR(NOW() - INTERVAL '1' YEAR, 'yyyy-mm-dd'),'{{start_date}}'))
+            AND CAST(jc.created AS TIMESTAMP) BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+            AND jc.resolution <> 'Rejected'
+    ) j
+
+    GROUP BY 1,2
+    )
+    
+    GROUP BY 1,2
+),    
+    
+sf_phone AS (
+
+    SELECT
+    
+        datestamp,
+        agent_email,
+        COUNT(DISTINCT conversation_id) AS call_count,
+        SUM(csat_score) AS csat_score,
+        COUNT(DISTINCT IF(csat_score = 1, conversation_id,NULL)) AS csat_1_star,
+        COUNT(DISTINCT IF(NOT csat_score IS NULL , conversation_id, NULL)) AS csat_count
+    
+    FROM (   
+          SELECT DISTINCT
+          
+              DATE_TRUNC('{{time_interval}}', CAST(DATE_FORMAT(fbp.conversation_end_timestamp_utc,'%Y-%m-%d %H:%i:%S') AS TIMESTAMP)) AS datestamp,
+              fbp.conversation_id,
+              CAST(REGEXP_REPLACE(MAX_BY(bps.queue_name, IF(REGEXP_LIKE(bps.queue_name, 'Survey_2_Resp_[1-5]'),bps.segment_start_timestamp_utc,NULL)),'Survey_2_Resp_', '') AS BIGINT) AS csat_score,
+              MAX_BY(dpa.email,IF(((bps.purpose = 'agent' AND bps.segment_type IN ('interact','dialing','wrapup')) OR (bps.purpose = 'user' AND bps.segment_type = 'dialing')),bps.segment_start_timestamp_utc,NULL)) AS agent_email
+                    
+          FROM customer_obsession.bliss_phone_segment bps
+          INNER JOIN customer_obsession.fact_bliss_phone fbp ON fbp.conversation_id = bps.conversation_id
+          LEFT JOIN customer_obsession.dim_purecloud_agent dpa ON dpa.user_id = bps.vendor_agent_id
+          
+          WHERE TRUE
+          AND DATE(bps.datestr) >= DATE('{{start_date}}') - INTERVAL '7' DAY
+          AND DATE(fbp.datestr) >= DATE('{{start_date}}') - INTERVAL '7' DAY
+              
+          GROUP BY 1,2
+          ) p
+
+    GROUP BY 1,2
+),
+
+merchant_cases AS ( ---m
+
+    SELECT DISTINCT
+    
+        DATE_TRUNC('{{time_interval}}',close_timestamp) as datestamp,
+        agent_email,
+        COUNT(DISTINCT ticket_uuid) AS cases,
+        SUM(csat_rating) AS csat_score,
+        COUNT(DISTINCT IF(csat_rating = 1, ticket_uuid, NULL)) AS csat_1_star,
+        COUNT(DISTINCT IF(NOT csat_rating IS NULL, ticket_uuid, NULL)) AS csat_count
+    
+    FROM (    
+          SELECT DISTINCT
+          
+              sfu.email as agent_email,
+              sfc.ticket_uuid,
+              sfc.closed_date_ts AS close_timestamp,
+              sfc.csat_rating_number as csat_rating
+              
+          FROM commops_ai.dim_eats_salesforce_case sfc
+          JOIN secure_kirby_external_data.salesforce_eats_user sfu
+              ON sfc.owner_id = sfu.id
+          
+          WHERE sfc.isclose_code
+          AND sfc.closed_date_ts BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+        )
+        
+    GROUP BY 1,2     
+),
+
+merchant_actions AS ( ---m2
+
+    SELECT DISTINCT
+    
+        DATE_TRUNC('{{time_interval}}',date) as datestamp,
+        agent_email,
+        SUM(cases_with_close_action) as cases_with_close_action,
+        SUM(solve_actions) as solve_actions,
+        SUM(productive_actions) AS productive_actions,
+        SUM(email_count) AS email_count
+    
+    FROM (  
+          SELECT DISTINCT
+            
+              sfu.email AS agent_email,
+              sfc.ticket_uuid,
+              sfc.email_text AS owner_email,
+              DATE(closed_date_ts) AS date,
+              COUNT(DISTINCT CASE WHEN REGEXP_LIKE(LOWER(h.value), 'closed') THEN h.createddate END) AS solve_actions,
+              COUNT(DISTINCT CASE WHEN h.value IN ('Pending Customer','On Hold','Closed: No response','Closed: Resolved') THEN h.createddate END) AS productive_actions,
+              COUNT(DISTINCT IF(sfc.email_text = sfu.email AND REGEXP_LIKE(LOWER(h.value), 'closed'), sfc.ticket_uuid, NULL)) AS cases_with_close_action,
+              COUNT(DISTINCT activityid) AS email_count
+              
+          FROM commops_ai.dim_eats_salesforce_case sfc
+          LEFT JOIN commops_ai.fact_eats_salesforce_case_history h
+              ON sfc.ticket_uuid = h.case_id
+              AND h.field = 'status'
+          LEFT JOIN eats_salesops.salesforce_user sfu
+              ON sfu.user_id = h.initiator_uuid
+          LEFT JOIN secure_kirby_external_data.salesforce_eats_emailmessage em
+            ON em.parentid = h.case_id
+            AND em.createdbyid = sfu.user_id
+        -- JOIN northam_ops o -- for raw data pull, remove after
+        --     ON o.agent_email = sfu.email
+              
+          WHERE TRUE
+          AND isclose_code
+          AND closed_date_ts between date('{{start_date}}') and cast('{{end_date}} 23:59:59' as timestamp)
+          GROUP BY 1,2,3,4
+         )
+
+    GROUP BY 1,2
+),
+
+    uber_health as (
+         select 
+            date_trunc('{{time_interval}}', hc.closeddate) as datestamp,
+            hc.owner_email as agent_email,
+            case
+                when last_assigned_queue = 'Uber Direct Support' then 'Elevated Direct Support'
+                else 'U4B Health'
+                end as line_of_business,
+            count(distinct hc.case_id) as cases,
+            sum(hc.csat_rating) as csat_sum,
+            count(hc.csat_rating) as csat_count
+         from
+            u4b.dim_salesforce_health_case hc
+        where
+            closeddate between date('{{start_date}}') and cast('{{end_date}} 23:59:59' as timestamp)
+        group by 1,2,3
+    ),
+    
+ churn_case_database AS (
+
+    SELECT DISTINCT
+    
+        DATE_TRUNC('{{time_interval}}', CAST(ch.createddate AS TIMESTAMP)) AS datestamp,
+        ch.case_id,
+        no.agent_email,
+        CASE 
+            WHEN LOWER(esc.origin_name) = 'pro-active support' THEN 'UET Churn Outbound'
+            WHEN LOWER(esc.origin_name) = 'us/can' OR esc.last_queue_code in ('US/CAN Reactive Churn','UberEats US/CAN CPP') THEN 'UET Churn Inbound'
+            ELSE ''
+        END AS line_of_business
+            
+    FROM commops_ai.fact_eats_salesforce_case_history ch
+    JOIN commops_ai.dim_eats_salesforce_case esc
+        ON ch.case_id = esc.ticket_uuid
+    JOIN eats_salesops.salesforce_user su
+        ON su.user_id = ch.initiator_uuid
+    JOIN northam_ops no
+        ON su.email = no.agent_email
+    
+    WHERE TRUE
+    AND CAST(ch.createddate AS TIMESTAMP) BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+    AND ch.field = 'status'
+    AND ch.value IN ('Closed: No Outreach','Closed: Resolved')
+    AND no.line_of_business IN ('UET Churn Inbound','UET Churn Outbound')
+),
+
+churn_conversion_database AS (
+
+    SELECT DISTINCT
+        DATE_TRUNC('{{time_interval}}', CAST(ch.createddate AS TIMESTAMP) + INTERVAL '14' DAY) AS datestamp,
+        ch.case_id AS convertible_id,
+        no.agent_email,
+          CASE 
+            WHEN LOWER(esc.origin_name) = 'pro-active support' THEN 'UET Churn Outbound'
+            WHEN LOWER(esc.origin_name) = 'us/can' OR esc.last_queue_code in ('US/CAN Reactive Churn','UberEats US/CAN CPP') THEN 'UET Churn Inbound'
+            ELSE ''
+        END AS line_of_business,
+        CASE
+            WHEN DATE(fet.restaurant_accept_timestamp_utc) BETWEEN CAST(ch.createddate AS TIMESTAMP) AND CAST(ch.createddate AS TIMESTAMP) + INTERVAL '14' DAY
+            THEN ch.case_id END AS converted_id
+
+    FROM commops_ai.fact_eats_salesforce_case_history ch
+        JOIN eats_salesops.salesforce_user su
+            ON su.user_id = ch.initiator_uuid
+        JOIN northam_ops no
+            ON su.email = no.agent_email
+        JOIN commops_ai.dim_eats_salesforce_case esc ON ch.case_id = esc.ticket_uuid
+            AND esc.level_5_code = 'Provided Resolution'
+        LEFT JOIN eats_salesops.salesforce_account sa ON esc.account_id = COALESCE(sa.acc_id, sa.acc_parentid)
+        LEFT JOIN eds.fact_eats_trip fet ON COALESCE(esc.requester_uuid, sa.acc_rest_uuid) = fet.restaurant_uuid
+            AND CAST(fet.datestr AS TIMESTAMP) >= DATE('{{start_date}}') - INTERVAL '1' MONTH
+    
+    WHERE TRUE
+        AND CAST(ch.createddate AS TIMESTAMP) BETWEEN DATE('{{start_date}}') - INTERVAL '14' DAY AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP) - INTERVAL '14' DAY
+        AND ch.field = 'status'
+        AND ch.value IN ('Closed: No Outreach','Closed: Resolved')
+        AND no.line_of_business IN ('UET Churn Inbound','UET Churn Outbound')
+    
+    GROUP BY
+        1, 2, 3, 4, 5
+
+),
+    
+churn_agg AS (    
+
+    SELECT DISTINCT
+            churn.datestamp,
+            churn.agent_email,
+            churn.line_of_business,
+            SUM(churn.interactions) AS interactions,
+            SUM(churn.conversion_n) AS conversion_n,
+            SUM(churn.conversion_d) AS conversion_d
+
+    FROM (
+        SELECT
+            db.datestamp,
+            db.agent_email,
+            db.line_of_business,
+            COUNT(DISTINCT db.case_id) AS interactions,
+            SUM(0) AS conversion_n,
+            SUM(0) AS conversion_d
+        FROM churn_case_database db
+        GROUP BY 1,2,3
+    UNION ALL
+        SELECT
+            cvt.datestamp,
+            cvt.agent_email,
+            cvt.line_of_business,
+            SUM(0) AS interactions,
+            COUNT(DISTINCT cvt.converted_id) AS conversion_n,
+            COUNT(DISTINCT cvt.convertible_id) AS conversion_d
+        FROM churn_conversion_database cvt
+        GROUP BY 1,2,3) churn
+
+    GROUP BY
+        1, 2, 3
+
+),
+
+sprinkr_case_database AS (
+
+    SELECT DISTINCT
+    
+        DATE_TRUNC('{{time_interval}}', dsi.close_timestamp) AS datestamp,
+        dsi.close_agent_email AS agent_email,
+        dsi.ticket_uuid AS solved_cases
+
+    FROM commops_ai.dim_support_interaction dsi
+    JOIN northam_ops op
+        ON dsi.close_agent_email = op.agent_email
+
+    WHERE TRUE
+    AND dsi.tool_name = 'SORT'
+    AND line_of_business = 'HiPo SORT'
+    AND dsi.close_timestamp BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+    AND dsi.status IN (
+                      'Closed',
+                      'Auto-Closed',
+                      'No Response Required',
+                      'Resolved',
+                      'Closed in Sprinklr',
+                      'Closed in Bliss',
+                      'Closed in JIRA'
+                      )
+),
+    
+sprinklr_agg AS (
+    
+    SELECT DISTINCT
+    
+        datestamp,
+        agent_email,
+        COUNT(solved_cases) AS solved_cases
+        
+    FROM sprinkr_case_database
+    
+    GROUP BY 1,2
+),
+    
+sprinklr_macros_actions AS (
+
+    SELECT
+    
+        DATE_TRUNC('{{time_interval}}', a.day) AS datestamp,
+        a.agent_email,
+        COUNT(*) AS macros_actions
+
+    FROM ( -- This sub-query is needed as the commops_ai.sort30_actions table does not contain a unique identifier for each action, therefore, this will prevent duplicates from happening
+          SELECT DISTINCT
+          
+              CAST(a.case_id AS VARCHAR) AS ticket_uuid,
+              a.macro_id,
+              a.updated_timestamp,
+              DATE(a.updated_timestamp) AS day,
+              a.emailaddress AS agent_email
+              
+          FROM commops_ai.sort30_actions a
+         ) a
+
+    GROUP BY 1,2
+),
+    
+    bliss_view AS (
+
+        SELECT DISTINCT
+             v.ticket_uuid
+            ,r.agent_email AS email
+            ,v.begin_timestamp
+            ,v.end_timestamp
+            ,b.badge
+            ,r.line_of_business
+        
+        FROM
+            customer_obsession.fact_bliss_view AS v
+            JOIN northam_workday_database r ON v.agent_uuid = r.agent_uuid
+            LEFT JOIN dwh.dim_bliss_ticket b ON v.ticket_uuid = b.uuid
+        
+        WHERE
+            TRUE
+            AND v.begin_timestamp BETWEEN CAST('{{start_date}}' AS TIMESTAMP) AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+            AND v.begin_timestamp BETWEEN r.hours_start AND r.hours_end
+            AND v.end_timestamp BETWEEN CAST('{{start_date}}' AS TIMESTAMP) AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+            AND v.end_timestamp BETWEEN r.hours_start AND r.hours_end 
+            AND v.duration_seconds < 10000
+            AND DATE(v.datestr) >= DATE('{{start_date}}') - INTERVAL '7' DAY
+
+    ),
+
+    all_combined AS (
+
+        SELECT 
+             email
+            ,line_of_business
+            ,begin_timestamp AS ts
+            ,ROW_NUMBER() OVER (PARTITION BY email, line_of_business ORDER BY begin_timestamp) AS type_count
+            ,'B' AS type
+            
+        FROM
+            bliss_view
+    
+        UNION ALL
+    
+        SELECT 
+             email
+            ,line_of_business
+            ,end_timestamp AS ts
+            ,ROW_NUMBER() OVER (PARTITION BY email, line_of_business ORDER BY end_timestamp) AS type_count
+            ,'E' AS type
+            
+        FROM
+            bliss_view
+    
+    ),
+
+    all_diff AS (
+
+        SELECT
+             *
+            ,CASE
+                WHEN type = 'E'
+                    OR type = 'B' AND LAG(type) OVER (PARTITION BY email, line_of_business ORDER BY ts,type_count) = 'B'
+                    OR type = 'B' AND LAG(type_count) OVER (PARTITION BY email, line_of_business ORDER BY ts,type_count) + 1 < type_count
+                THEN DATE_DIFF('SECOND', LAG(ts) OVER (PARTITION BY email, line_of_business ORDER BY ts,type_count), ts)
+                ELSE 0 END AS diff
+    
+        FROM
+            all_combined 
+
+    ),
+
+    prod_combined AS (
+
+        SELECT 
+             email
+            ,line_of_business
+            ,begin_timestamp AS ts
+            ,ROW_NUMBER() OVER (PARTITION BY email, line_of_business ORDER BY begin_timestamp) AS type_count
+            ,'B' AS type 
+            
+        FROM
+            bliss_view
+
+        WHERE
+            TRUE
+            AND ticket_uuid != 'end of queue'
+            AND (CASE WHEN line_of_business = 'Diamond Rider' THEN badge IN('platinum','ecr','aladdin','simba') ELSE TRUE END)
+    
+        UNION ALL
+
+        SELECT 
+             email
+            ,line_of_business
+            ,end_timestamp AS ts
+            ,ROW_NUMBER() OVER (PARTITION BY email, line_of_business ORDER BY end_timestamp) AS type_count
+            ,'E' AS type
+    
+        FROM
+            bliss_view
+
+        WHERE
+            TRUE
+            AND ticket_uuid != 'end of queue'
+            AND (CASE WHEN line_of_business = 'Diamond Rider' THEN badge IN('platinum','ecr','aladdin','simba') ELSE TRUE END)
+    
+    ),
+
+    prod_diff AS (
+        
+        SELECT 
+             *
+            ,CASE
+                WHEN type = 'E'
+                    OR type = 'B' AND LAG(type) OVER (PARTITION BY email, line_of_business ORDER BY ts,type_count) = 'B'
+                    OR type = 'B' AND LAG(type_count) OVER (PARTITION BY email, line_of_business ORDER BY ts,type_count) + 1 < type_count
+                THEN DATE_DIFF('SECOND', LAG(ts) OVER (PARTITION BY email, line_of_business ORDER BY ts,type_count), ts)
+                ELSE 0 END AS diff
+
+        FROM
+            prod_combined 
+    
+    ),
+
+    all_final AS (
+
+        SELECT 
+             email
+            ,line_of_business
+            ,DATE_TRUNC('{{time_interval}}', ts) AS view_date
+            ,SUM(diff) AS all_handle_time 
+        
+        FROM all_diff 
+    
+        GROUP BY
+            1, 2, 3
+
+    ),
+
+    prod_final AS (
+
+        SELECT 
+             email
+            ,line_of_business
+            ,DATE_TRUNC('{{time_interval}}', ts) AS view_date
+            ,SUM(diff) AS ticket_handle_time 
+            
+        FROM
+            prod_diff 
+        
+        GROUP BY
+            1, 2, 3
+    ),
+    
+    otter_time AS (
+
+        SELECT 
+             a.email AS agent_email
+            ,a.view_date AS datestamp
+            ,a.line_of_business
+            ,a.all_handle_time AS all_handle_time_seconds
+            ,(CASE WHEN p.ticket_handle_time IS NULL THEN 0 ELSE p.ticket_handle_time END) AS productive_handle_time_seconds
+            ,a.all_handle_time - (CASE WHEN p.ticket_handle_time IS NULL THEN 0 ELSE p.ticket_handle_time END) AS otter_time_seconds
+            
+        FROM all_final a 
+        LEFT JOIN prod_final p ON a.email = p.email AND a.view_date = p.view_date AND a.line_of_business = p.line_of_business 
+    
+),
+    
+qa_union AS (
+
+    SELECT-- Spotcheck 1.0
+    
+        qa.inventoryuseremail AS agent_email,
+        CAST(qa.publisheddateutc AS TIMESTAMP) AS datestamp,
+        qa.agent_composite_score AS qa_score,
+        qa.ticket_uuid AS qa_ticket
+
+    FROM customer_obsession.nice_spotcheck_scores qa
+    
+    WHERE TRUE
+    AND qa.load_date IS NOT NULL
+    AND qa.inventoryusersite IN ('COE_UBR_CHI','COE_UBR_PHX','COE_UBR_NSH')
+    AND CAST(qa.publisheddateutc AS TIMESTAMP) BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+    
+UNION ALL
+    
+    SELECT -- kirby table for Spotcheck 2.0
+
+        qa.inventoryuseremail AS agent_email,
+        CAST(qa.publisheddateutc AS TIMESTAMP) AS datestamp,
+        qa.audit_scores AS qa_score,
+        qa.ticket_uuid AS qa_ticket
+
+    FROM kirby_external_data.spotcheck_2_o_raw_data qa
+
+    WHERE TRUE
+    AND qa.inventoryusersite IN ('COE_UBR_CHI','COE_UBR_PHX','COE_UBR_NSH')
+    AND CAST(qa.publisheddateutc AS TIMESTAMP) BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+
+UNION ALL
+
+    SELECT-- historical Spotcheck scores from Periscope
+        
+        qa.agent_email,
+        qa.datestamp,
+        qa.agent_sc_score AS qa_score,
+        qa.qa_ticket
+        	
+        FROM (
+              SELECT DISTINCT SUBSTRING(SPLIT(ticket_link, '/')[CARDINALITY(SPLIT(ticket_link, '/'))], 1, STRPOS(SPLIT(ticket_link, '/')[CARDINALITY(SPLIT(ticket_link, '/'))], ')') - 1) AS qa_ticket,	
+              CAST(review_week AS TIMESTAMP) AS datestamp,
+              agent_email,
+              agent_sc_score
+              
+              FROM commops.coe_global_spotcheck_qa qa
+              
+              WHERE TRUE
+              AND CAST(review_date AS TIMESTAMP) BETWEEN CAST('{{start_date}}' AS TIMESTAMP) AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)	
+              AND site_code IN('COE_UBR_CHI','COE_UBR_PHX','COE_UBR_NSH')	
+             ) qa
+    	
+UNION ALL
+    
+    SELECT -- non-standard QA sources: https://docs.google.com/spreadsheets/d/1ZZHDkaVBPxnPF-cvbUtYwAkuf-Jns8-mfyozfwh5Qak/edit#gid=0
+    
+            qa.agent_email,
+            CAST(audit_timestamp AS TIMESTAMP) AS datestamp,
+            qa.qa_score,
+            qa.ticket AS qa_ticket
+            
+    FROM kirby_external_data.northam_commops_non_standard_qa qa
+
+    WHERE TRUE
+    AND qa.audit_timestamp BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+     
+),
+
+qa_ticket_uniformity AS ( -- combined raw ticket data with qa_ticket comformity logic to ensure the values match to reduce the chance of duplicate audits.
+
+    SELECT
+    
+        qu.datestamp AS audit_date,
+        qu.agent_email,
+        COALESCE(qu.qa_score,0) AS qa_score,
+        CASE
+            WHEN qu.qa_ticket LIKE '%contact%' THEN REGEXP_EXTRACT(qu.qa_ticket,'[0-9A-Za-z]{8}-[0-9A-Za-z]{4}-[0-9A-Za-z]{4}-[0-9A-Za-z]{4}-[0-9A-Za-z]{12}') -- Bliss
+            WHEN qu.qa_ticket LIKE '%reports/%' THEN SUBSTR(qu.qa_ticket, POSITION('reports/' IN qu.qa_ticket) + 8, 24) -- Checkr
+            WHEN REGEXP_EXTRACT(qu.qa_ticket, '([a-zA-Z0-9]{15,18})(?:|$)') IS NOT NULL THEN REGEXP_EXTRACT(qu.qa_ticket, '([a-zA-Z0-9]{15,18})(?:|$)') -- Salesforce
+            WHEN qu.qa_ticket LIKE '%jira%' AND REGEXP_EXTRACT(qu.qa_ticket, '([a-zA-Z0-9]+-[a-zA-Z0-9]+)') IS NOT NULL THEN REGEXP_EXTRACT(qu.qa_ticket, '([a-zA-Z0-9]+-[a-zA-Z0-9]+)') --JIRA
+            WHEN qu.qa_ticket LIKE '%XXXX%' OR qu.qa_ticket = '' THEN CONCAT(CAST(DATE_FORMAT(qu.datestamp, '%Y-%m-%d') AS VARCHAR),'+',CAST(UUID() AS VARCHAR)) -- replaces null ticket field with a combination of the time of the audit, the LOB, the QA source, and a random UUID
+            ELSE qu.qa_ticket
+        END AS qa_ticket
+            
+    FROM qa_union qu
+),
+
+qa_full AS (
+
+    SELECT DISTINCT
+    
+            DATE_TRUNC('{{time_interval}}',audit_date) AS datestamp,
+            agent_email,
+            SUM(qa_score) AS qa_sum,
+            COUNT(qa_ticket) AS qa_count
+            
+    FROM qa_ticket_uniformity
+    
+    GROUP BY 1,2
+)
+
+SELECT DISTINCT
+         DATE_FORMAT(NOW() AT TIME ZONE 'America/Phoenix','%Y-%m-%d %H:%i') || ' MST' AS run_timestamp
+        ,coalesce(NULLIF('{{month}}',''),scd.target_month) as monthstamp
+        ,DATE_TRUNC('week', o.datestamp) AS weekstamp
+        ,'{{time_interval}}' AS timetype
+        ,o.datestamp
+        ,DENSE_RANK() OVER(ORDER BY o.datestamp DESC) AS dateorder
+        ,o.agent_name
+        ,o.agent_email
+        ,o.site_code
+        ,o.line_of_business
+        ,o.team_lead_name
+        ,o.team_lead_email
+        ,o.manager_name
+        ,o.manager_email
+        ,COALESCE(w.productive_hours,0) AS scheduled_productive_hours
+        ,COALESCE(CAST(t.otter_time_seconds AS DOUBLE)/3600,0) AS otter_time_hours
+        ,CASE -- Efficiency Primary (KPI 1)
+            WHEN o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations', 'UGO Specialized','Diamond Rider') THEN 'Average Handle Time'
+            WHEN o.line_of_business IN('BGC: Checkr','Merchant Premium Support','Merchant Global Delivery Partner') THEN 'Cases per Hour'
+            when o.line_of_business in('Uber Health') then 'Tickets per Hour'
+            WHEN o.line_of_business IN('ASR 360','BGC: JIRA','Driver C360','Rider C360','SAFE: RRT','SAFE: FP','SAFE: Triage','UET: FasTrack') THEN 'Jiras per Hour'
+            when o.line_of_business in('Delivery Experience') then 'Average Handle Time'
+            WHEN o.line_of_business IN('HiPo SORT') THEN 'Cases per Hour'
+            when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound') then 'Tickets per Hour'
+            when o.line_of_business in('Merchant Snowball') then 'Solve Actions Per Hour'
+            ELSE 'Efficiency Primary [Not Applicable]' END AS eff_1_type
+        ,CASE
+            WHEN o.line_of_business IN('SAFE: Triage') THEN 'Cases Created'
+            WHEN o.line_of_business IN('BGC: JIRA','Driver C360','Rider C360','SAFE: RRT','SAFE: FP','SAFE: Triage','Merchant Premium Support','Merchant Global Delivery Partner','HiPo SORT','UET: FasTrack') THEN 'Cases Solved'
+            when o.line_of_business in('Uber Health') then 'Tickets Solved'
+            WHEN o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations', 'UGO Specialized','Diamond Rider') THEN 'Phone Interaction Time'
+            when o.line_of_business in('Delivery Experience') then 'Handle Time'
+            when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound') then 'Tickets Solved'
+            when o.line_of_business in('Merchant Snowball') then 'Solve Actions'
+            END AS eff_1_type_n
+        ,CASE
+            WHEN o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations', 'UGO Specialized','Diamond Rider') THEN 'Phone Interactions'
+            when o.line_of_business in('Delivery Experience') then 'Tickets Solved'
+            when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound','Merchant Premium Support','Merchant Global Delivery Partner','Merchant Snowball','HiPo SORT','UET: FasTrack') then 'Productive Hours'
+            ELSE 'Productive Hours'
+            END AS eff_1_type_d
+        ,CASE
+            WHEN w.productive_hours > 0 AND o.line_of_business IN('BGC: JIRA','Driver C360','Rider C360','UET: FasTrack') THEN COALESCE(j.jira, 0)
+            WHEN w.productive_hours > 0 AND o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations','UGO Specialized','Diamond Rider') THEN COALESCE(p.bliss_phone_time, 0)
+            WHEN w.productive_hours > 0 AND o.line_of_business IN('SAFE: FP','SAFE: RRT','SAFE: Triage') THEN COALESCE(sj.jira, 0)
+            when w.productive_hours > 0 and o.line_of_business in('Delivery Experience') then coalesce(ht.handle_time_mins, 0)
+            when w.productive_hours > 0 and o.line_of_business in('Merchant Premium Support','Merchant Global Delivery Partner') then COALESCE(m.cases, 0)
+            when w.productive_hours > 0 and o.line_of_business in('Uber Health') then coalesce(h.cases, 0)
+            when w.productive_hours > 0 and o.line_of_business in('HiPo SORT') then coalesce(sp.solved_cases,0)
+            when w.productive_hours > 0 and o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound') then coalesce(c.interactions, 0)
+            when w.productive_hours > 0 and o.line_of_business in('Merchant Snowball') then coalesce(m2.solve_actions,0)
+            ELSE 0 END AS eff_1_n
+        ,CASE
+            WHEN w.productive_hours > 0 AND o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations','UGO Specialized','Diamond Rider') THEN COALESCE(p.bliss_phone, 0)
+            WHEN w.productive_hours > 0 AND o.line_of_business IN('SAFE: Triage') THEN COALESCE(w.productive_hours, 0) - COALESCE(CAST(t.otter_time_seconds AS DOUBLE)/3600, 0)
+            when w.productive_hours > 0 and o.line_of_business in('Delivery Experience') then coalesce(a3.bliss_solves,0)
+            when w.productive_hours > 0 and o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound','Merchant Premium Support','Merchant Global Delivery Partner','Merchant Snowball','UET: FasTrack') then COALESCE(w.productive_hours, 0)
+            ELSE COALESCE(productive_hours, 0)
+            END AS eff_1_d
+        ,CASE -- Efficiency Secondary (KPI 2)
+            WHEN o.line_of_business IN('SAFE: Triage') THEN 'Triage Bliss APH'
+            when o.line_of_business in('SAFE: FP','SAFE: RRT') Then 'TSI Bliss APH'
+            when o.line_of_business in('Delivery Experience') then 'Tickets per Hour'
+            when o.line_of_business in('HiPo SORT') then 'Sprinklr Macro Actions'
+            when o.line_of_business in('Merchant Snowball') then 'Resolution Efficiency'
+            when o.line_of_business in('UET: FasTrack') then 'Comments Per Hour'
+            when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound') then 'Restaurant Retention 14D'
+            when o.line_of_business in('Merchant Premium Support','Merchant Global Delivery Partner') then 'Actions Per Hour'
+            ELSE 'Efficiency Secondary [Not Applicable]'
+            END AS eff_2_type
+        ,CASE
+            WHEN o.line_of_business IN('SAFE: Triage') THEN 'Approved Triage Bliss Actions'
+            when o.line_of_business in('SAFE: FP','SAFE: RRT') Then 'Approved TSI Bliss Actions'
+            when o.line_of_business in('Delivery Experience') then 'Tickets Solved'
+            when o.line_of_business in('HiPo SORT') then 'Sprinklr Macro Actions'
+            when o.line_of_business in('Merchant Snowball') then 'Cases Solved'
+            when o.line_of_business in('Merchant Premium Support','Merchant Global Delivery Partner') then 'Solve Actions, Emails, Calls'
+            when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound') then 'Churn Prevented 14D'
+            when o.line_of_business in('UET: FasTrack') then 'Comments'
+            ELSE ''
+            END AS eff_2_type_n
+        ,CASE
+            WHEN o.line_of_business IN('SAFE: Triage', 'SAFE: RRT', 'SAFE:FP','HiPo SORT') THEN 'Productive Hours'
+            when o.line_of_business in('Delivery Experience','UET: FasTrack','Merchant Premium Support','Merchant Global Delivery Partner') then 'Productive Hours'
+            when o.line_of_business in('Merchant Snowball') then 'Solve Actions'
+            when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound') then 'Restaurants At Risk 14D'
+            ELSE ''
+            END AS eff_2_type_d
+        ,CASE
+            WHEN w.productive_hours > 0 and o.line_of_business IN('SAFE: Triage') THEN COALESCE(a2.bliss_triage_actions, 0)
+            WHEN w.productive_hours > 0 and o.line_of_business IN('SAFE: FP','SAFE: RRT') THEN COALESCE(a2.bliss_tsi_actions, 0)
+            when w.productive_hours > 0 and o.line_of_business in('Delivery Experience') then coalesce(a3.bliss_solves,0)
+            WHEN w.productive_hours > 0 AND o.line_of_business IN ('HiPo SORT') THEN COALESCE(sa.macros_actions, 0)
+            when w.productive_hours > 0 and o.line_of_business in('Merchant Snowball') then coalesce(m2.cases_with_close_action,0)
+            WHEN o.line_of_business IN('Merchant Premium Support','Merchant Global Delivery Partner') THEN COALESCE(m2.productive_actions, 0) + COALESCE(m2.email_count, 0) + COALESCE(s.call_count, 0)
+            when o.line_of_business in ('UET Churn Inbound', 'UET Churn Outbound') then coalesce(c.conversion_n,0)
+            when o.line_of_business in('UET: FasTrack') then COALESCE(ft.comments,0)
+            ELSE 0 END AS eff_2_n
+        ,CASE
+            WHEN w.productive_hours > 0 and o.line_of_business IN('SAFE: Triage') THEN COALESCE(w.productive_hours, 0) - COALESCE(CAST(t.otter_time_seconds AS DOUBLE)/3600, 0)
+            WHEN w.productive_hours > 0 and o.line_of_business IN('SAFE: FP', 'SAFE: RRT','HiPo SORT','Merchant Premium Support','Merchant Global Delivery Partner') THEN COALESCE(w.productive_hours, 0)
+            when o.line_of_business in('Delivery Experience') then coalesce(productive_hours,0)
+            when w.productive_hours > 0 and o.line_of_business in('Merchant Snowball') then coalesce(m2.solve_actions,0)
+            when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound') then coalesce(c.conversion_d,0)
+            WHEN o.line_of_business IN('UET: FasTrack') THEN COALESCE(w.productive_hours, 0)
+            ELSE 0 END AS eff_2_d
+        ,CASE -- CSAT Primary (KPI 3)
+            WHEN o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations','UGO Specialized') THEN '1-Star CSAT'
+            WHEN o.line_of_business IN('Driver C360','Rider C360') THEN '1-Star CSAT'
+            WHEN o.line_of_business IN('Diamond Rider') THEN '1-Star CSAT'
+            when o.line_of_business in('Delivery Experience') then '1-Star CSAT'
+            WHEN o.line_of_business IN('Merchant Premium Support','Merchant Global Delivery Partner') THEN 'CSAT (Cases + Phone)'
+            WHEN o.line_of_business IN('Uber Health') THEN 'CSAT (Salesforce)'
+            WHEN o.line_of_business IN('UET: FasTrack') THEN 'JIRA CSAT'
+            ELSE 'CSAT Primary [Not Applicable]' END AS csat_1_type
+        ,CASE
+            WHEN o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations','UGO Specialized') THEN '1-Star Surveys'
+            WHEN o.line_of_business IN('Driver C360','Rider C360') THEN '1-Star Surveys'
+            WHEN o.line_of_business IN('Diamond Rider') THEN '1-Star Surveys'
+            when o.line_of_business in('Delivery Experience') then '1-Star Surveys'
+            WHEN o.line_of_business IN('Merchant Premium Support','Merchant Global Delivery Partner','UET: FasTrack') THEN 'Sum of CSAT Scores'
+            when o.line_of_business in('Uber Health') then 'Sum of CSAT Scores'
+            ELSE '' END AS csat_1_type_n
+        ,CASE
+            WHEN o.line_of_business IN('Driver Messaging Escalations','Consumer Escalations') THEN 'CSAT Surveys'
+            WHEN o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations','UGO Specialized') THEN 'CSAT Surveys'
+            WHEN o.line_of_business IN('Driver C360','Rider C360') THEN 'CSAT Surveys'
+            WHEN o.line_of_business IN('Diamond Rider') THEN 'CSAT Surveys'
+            when o.line_of_business in('Delivery Experience','Merchant Premium Support','Merchant Global Delivery Partner','UET: FasTrack') then 'CSAT Surveys'
+            when o.line_of_business in('Uber Health') then 'CSAT Surveys'
+            ELSE '' END AS csat_1_type_d
+        ,CASE
+            WHEN o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations','UGO Specialized') THEN COALESCE(p2.bliss_phone_1_star, 0)
+            WHEN o.line_of_business IN('Driver C360','Rider C360') THEN COALESCE(j.bliss_jira_1_star, 0)
+            WHEN o.line_of_business IN('Diamond Rider') THEN COALESCE(p2.bliss_phone_1_star, 0)
+            when o.line_of_business in('Delivery Experience') then coalesce(a3.bliss_app_1_star, 0)
+            WHEN o.line_of_business IN ('Merchant Premium Support','Merchant Global Delivery Partner') THEN COALESCE(m.csat_score, 0) + COALESCE(s.csat_score, 0)
+            when o.line_of_business in('Uber Health') then coalesce(h.csat_sum, 0)
+            WHEN o.line_of_business IN('UET: FasTrack') THEN COALESCE(j.jira_stars, 0)
+            ELSE 0 END AS csat_1_n
+        ,CASE
+            WHEN o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations','UGO Specialized') THEN COALESCE(CAST(p2.bliss_phone_surveys AS DOUBLE), 0)
+            WHEN o.line_of_business IN('Driver C360','Rider C360') THEN COALESCE(j.bliss_jira_surveys, 0)
+            WHEN o.line_of_business IN('Diamond Rider') THEN COALESCE(p2.bliss_phone_surveys, 0)
+            WHEN o.line_of_business IN('Delivery Experience') THEN COALESCE(a3.bliss_app_surveys, 0)
+            WHEN o.line_of_business IN ('Merchant Premium Support','Merchant Global Delivery Partner') THEN COALESCE(m.csat_count, 0) + COALESCE(s.csat_count, 0)
+            when o.line_of_business in('Uber Health') then coalesce(h.csat_count, 0)
+            WHEN o.line_of_business IN('UET: FasTrack') THEN COALESCE(j.jira_surveys, 0)
+            ELSE 0 END AS csat_1_d
+        ,CASE -- CSAT Secondary (KPI 4)
+            WHEN o.line_of_business IN('UGO Specialized') THEN 'CSAT (Bliss)'
+            WHEN o.line_of_business IN('Diamond Rider','Delivery Experience') THEN '5-Star CSAT'
+            when o.line_of_business in('Driver Phone Escalations','Driver C360','Rider C360') then 'CSAT (Bliss)'
+            when o.line_of_business in('Merchant Premium Support','Merchant Global Delivery Partner') then 'Resolution Efficiency'
+            ELSE 'CSAT Secondary [Not Applicable]' END AS csat_2_type
+        ,CASE
+            WHEN o.line_of_business IN('UGO Specialized') THEN 'Sum of CSAT Scores'
+            WHEN o.line_of_business IN('Diamond Rider','Delivery Experience') THEN '5-Star Surveys'
+            when o.line_of_business in('Driver Phone Escalations','Driver C360','Rider C360') then 'Sum of CSAT Scores'
+            when o.line_of_business in('Merchant Premium Support','Merchant Global Delivery Partner') then 'Cases Solved'
+            ELSE '' END AS csat_2_type_n
+        ,CASE
+            WHEN o.line_of_business IN('UGO Specialized') THEN 'CSAT Surveys'
+            WHEN o.line_of_business IN('Diamond Rider') THEN 'CSAT Surveys'
+            WHEN o.line_of_business IN('Delivery Experience') THEN 'CSAT Surveys'
+            when o.line_of_business in('Driver Phone Escalations','Driver C360','Rider C360') then 'CSAT Surveys'
+            when o.line_of_business in('Merchant Premium Support','Merchant Global Delivery Partner') then 'Solve Actions'
+            ELSE '' END AS csat_2_type_d
+        ,CASE
+            WHEN o.line_of_business IN('Diamond Rider') THEN COALESCE(p2.bliss_phone_5_star, 0)
+            WHEN o.line_of_business IN('Delivery Experience') THEN COALESCE(a3.bliss_app_5_star, 0)
+            when o.line_of_business in('UGO Specialized','Driver Phone Escalations') then COALESCE(p2.bliss_phone_stars, 0)
+            WHEN o.line_of_business IN('Driver C360','Rider C360') THEN COALESCE(bliss_jira_stars, 0)
+            when o.line_of_business in('Merchant Premium Support','Merchant Global Delivery Partner') then coalesce(m2.cases_with_close_action,0)
+            ELSE 0 END AS csat_2_n
+        ,CASE
+            WHEN o.line_of_business IN('Diamond Rider') THEN COALESCE(p2.bliss_phone_surveys, 0)
+            WHEN o.line_of_business IN('Delivery Experience') THEN COALESCE(a3.bliss_app_surveys, 0) 
+            when o.line_of_business in('UGO Specialized','Driver Phone Escalations') then COALESCE(CAST(p2.bliss_phone_surveys AS DOUBLE), 0)
+            WHEN o.line_of_business IN('Driver C360','Rider C360') THEN COALESCE(bliss_jira_surveys, 0)
+            when o.line_of_business in('Merchant Premium Support','Merchant Global Delivery Partner') then coalesce(m2.solve_actions,0)
+            ELSE 0 END AS csat_2_d
+        ,CASE --Quality Audit Primary (KPI 5)
+            WHEN o.line_of_business IN('SAFE: RRT','SAFE: FP','SAFE: Triage') THEN 'Quality Score'
+            WHEN o.line_of_business IN('Driver Payment - Phone','Diamond Rider','Driver Phone Escalations') THEN 'Quality Score'
+            WHEN o.line_of_business IN('Driver C360','Rider C360') THEN 'Quality Score'
+            WHEN o.line_of_business IN('BGC: JIRA','BGC: Checkr') THEN 'Quality Score'
+            when o.line_of_business in('HiPo SORT') then 'Quality Score'
+            when o.line_of_business in('UGO Specialized') then 'Quality Score'
+            when o.line_of_business in('Uber Health') then 'Quality Score'
+            when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound','Merchant Premium Support','Merchant Snowball','UET: FasTrack') then 'Quality Score'
+            ELSE 'Quality Audits Primary [Not Applicable]' END AS qa_1_type
+        ,CASE
+            WHEN o.line_of_business IN('SAFE: RRT','SAFE: FP','SAFE: Triage','HiPo SORT') THEN 'Sum of Quality Scores'
+            WHEN o.line_of_business IN('Driver Payment - Phone','Diamond Rider','Driver Phone Escalations') THEN 'Sum of Quality Scores'
+            WHEN o.line_of_business IN('Driver C360','Rider C360') THEN 'Sum of Quality Scores'
+            WHEN o.line_of_business IN('BGC: JIRA','BGC: Checkr') THEN 'Sum of Quality Scores'
+            when o.line_of_business in('UGO Specialized') then 'Sum of Quality Scores'
+            when o.line_of_business in('Uber Health') then 'Sum of Quality Scores'
+            when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound','Merchant Premium Support','Merchant Snowball','UET: FasTrack') then 'Sum of Quality Scores'
+            ELSE '' END AS qa_1_type_n
+        ,CASE
+            WHEN o.line_of_business IN('SAFE: RRT','SAFE: FP','SAFE: Triage','HiPo SORT') THEN 'Quality Audits'
+            WHEN o.line_of_business IN('Driver Payment - Phone','Diamond Rider','Driver Phone Escalations') THEN 'Quality Audits'
+            WHEN o.line_of_business IN('Driver C360','Rider C360') THEN 'Quality Audits'
+            WHEN o.line_of_business IN('BGC: JIRA','BGC: Checkr') THEN 'Quality Audits'
+            when o.line_of_business in('UGO Specialized') then 'Quality Audits'
+            when o.line_of_business in('Uber Health') then 'Quality Audits'
+            when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound','Merchant Premium Support','Merchant Snowball') then 'Quality Audits'
+            ELSE '' END AS qa_1_type_d
+        ,CASE
+            WHEN o.line_of_business IN('SAFE: RRT','SAFE: FP','SAFE: Triage','HiPo SORT') THEN COALESCE(q.qa_sum, 0)
+            WHEN o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations','Uber Health') THEN COALESCE(q.qa_sum, 0)
+            when o.line_of_business in('Diamond Rider') then  COALESCE(q.qa_sum, 0)
+            WHEN o.line_of_business IN('Driver C360','Rider C360') THEN COALESCE(q.qa_sum, 0)
+            when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound','Merchant Premium Support','Merchant Snowball','UET: FasTrack') then  COALESCE(q.qa_sum, 0)
+            when o.line_of_business in('UGO Specialized') then coalesce(q.qa_sum, 0)
+            ELSE 0 END AS qa_1_n
+        ,CASE
+            WHEN o.line_of_business IN('SAFE: FP', 'SAFE: Triage', 'SAFE: RRT','HiPo SORT') THEN COALESCE(q.qa_count, 0)
+            WHEN o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations','Uber Health') THEN COALESCE(q.qa_count, 0)
+            when o.line_of_business in('Diamond Rider') then  COALESCE(q.qa_count, 0)
+            WHEN o.line_of_business IN('Driver C360','Rider C360') THEN COALESCE(q.qa_count, 0)
+            when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound','Merchant Premium Support','Merchant Snowball','UET: FasTrack') then  COALESCE(q.qa_count, 0)
+            when o.line_of_business in('UGO Specialized') then coalesce(q.qa_count, 0)
+            ELSE 0 END AS qa_1_d
+            
+        ,COALESCE(trim(n.eff_1_excellence), '0') AS eff_1_excellence
+        ,COALESCE(trim(n.eff_1_expectation), '0') AS eff_1_expectation
+        ,COALESCE(trim(n.eff_1_weight), '0') AS eff_1_weight
+        ,COALESCE(trim(n.eff_1_min), '0') AS eff_1_min
+        
+        ,COALESCE(trim(n.eff_2_excellence), '0') AS eff_2_excellence
+        ,COALESCE(trim(n.eff_2_expectation), '0') AS eff_2_expectation
+        ,COALESCE(trim(n.eff_2_weight), '0') AS eff_2_weight
+        ,COALESCE(trim(n.eff_2_min), '0') AS eff_2_min
+        
+        ,COALESCE(trim(n.csat_1_excellence), '0') AS csat_1_excellence
+        ,COALESCE(trim(n.csat_1_expectation), '0') AS csat_1_expectation
+        ,COALESCE(trim(n.csat_1_weight), '0') AS csat_1_weight
+        ,COALESCE(trim(n.csat_1_min), '0') AS csat_1_min
+        
+        ,COALESCE(trim(n.csat_2_excellence), '0') AS csat_2_excellence
+        ,COALESCE(trim(n.csat_2_expectation), '0') AS csat_2_expectation
+        ,COALESCE(trim(n.csat_2_weight), '0') AS csat_2_weight
+        ,COALESCE(trim(n.csat_2_min), '0') AS csat_2_min
+        
+        ,COALESCE(trim(n.qa_1_excellence), '0') AS qa_1_excellence
+        ,COALESCE(trim(n.qa_1_expectation), '0') AS qa_1_expectation
+        ,COALESCE(trim(n.qa_1_weight), '0') AS qa_1_weight
+        ,COALESCE(trim(n.qa_1_min), '0') AS qa_1_min
+
+    FROM
+        northam_full o
+        LEFT JOIN northam_workday w ON  o.agent_email = w.agent_email
+            AND o.datestamp = w.datestamp
+            AND o.line_of_business = w.line_of_business
+        LEFT JOIN kirby_external_data.p4p_usc_coe_targets n ON o.line_of_business = n.line_of_business	
+            AND (
+                ('{{month}}' <> '' and DATE(n.target_month) = DATE(NULLIF('{{month}}','')))
+                or
+                ('{{month}}' = '' and date_trunc('day',o.datestamp) BETWEEN DATE(n.scorecard_month_start) AND CAST(concat(n.scorecard_month_end,' 23:59:59') AS TIMESTAMP))
+                )
+        LEFT JOIN scorecard_dates scd on o.datestamp BETWEEN DATE(scd.scorecard_month_start) AND CAST(concat(scd.scorecard_month_end,' 23:59:59') AS TIMESTAMP)
+        LEFT JOIN bliss_app_actions_agg a2 ON w.agent_email = a2.agent_email
+            AND w.datestamp = a2.datestamp
+            and case when o.line_of_business in('Consumer Escalations','Driver Messaging Escalations') then o.line_of_business = a2.line_of_business else true end
+        LEFT JOIN bliss_app_solves_agg a3 ON w.agent_email = a3.agent_email
+            AND w.datestamp = a3.datestamp
+            and case when o.line_of_business in('Consumer Escalations','Driver Messaging Escalations') then o.line_of_business = a3.line_of_business else true end
+        left join bliss_handle_time ht on w.agent_email = ht.agent_email
+            and w.datestamp = ht.datestamp
+        LEFT JOIN bliss_phone_calls p ON w.agent_email = p.agent_email
+            AND w.datestamp = p.datestamp
+        LEFT JOIN bliss_phone_csat p2 ON w.agent_email = p2.agent_email
+            AND w.datestamp = p2.datestamp
+        LEFT JOIN otter_time t ON w.agent_email = t.agent_email
+            AND w.datestamp = t.datestamp
+            AND w.line_of_business = t.line_of_business
+        LEFT JOIN jira j ON w.agent_email = j.agent_email
+            AND w.datestamp = j.datestamp
+            AND w.line_of_business = j.line_of_business
+         LEFT JOIN safety_jira_agg sj ON w.agent_email = sj.agent_email
+            AND w.datestamp = sj.datestamp
+            AND ((w.line_of_business IN('SAFE: RRT','SAFE: FP') 
+                    AND sj.line_of_business = 'SAFE: Resolved')
+                    OR 
+                (w.line_of_business = sj.line_of_business))
+        left join uber_health h on w.agent_email = h.agent_email
+            and w.datestamp = h.datestamp
+            and (w.line_of_business <> 'Elevated Direct Support' and h.line_of_business = 'U4B Health')
+        left join churn_agg c on o.agent_email = c.agent_email
+            and o.datestamp = c.datestamp
+            and o.line_of_business = c.line_of_business
+        LEFT JOIN qa_full q ON o.agent_email = q.agent_email
+            AND o.datestamp = q.datestamp
+        LEFT JOIN merchant_cases m on w.agent_email = m.agent_email
+            AND w.datestamp = m.datestamp
+        LEFT JOIN merchant_actions m2 on w.agent_email = m2.agent_email
+            AND w.datestamp = m2.datestamp    
+        LEFT JOIN sf_phone s ON w.agent_email = s.agent_email
+            AND w.datestamp = s.datestamp
+        LEFT JOIN sprinklr_agg sp on o.agent_email = sp.agent_email
+            AND o.datestamp = sp.datestamp
+        LEFT JOIN  sprinklr_macros_actions sa on o.agent_email = sa.agent_email  
+            and o.datestamp = sa.datestamp
+        LEFT JOIN fast_track_comments_agg ft on w.agent_email = ft.agent_email
+            AND w.datestamp = ft.datestamp     
