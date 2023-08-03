@@ -1,0 +1,220 @@
+SET SESSION hash_partition_count = 64;
+
+WITH
+    
+    scorecard_dates as (
+    SELECT DISTINCT
+        target_month
+        ,scorecard_month_start
+        ,scorecard_month_end
+    from kirby_external_data.p4p_usc_coe_targets
+    ),
+    
+    northam_workday_database AS (
+        SELECT DISTINCT
+              b.uuid AS agent_uuid
+             ,h.email AS agent_email
+             ,case when h.staffing_group = 'Delivery Experience' then 'Delivery Experience'
+                   when l.line_of_business_mapped = 'Non-MDS_Merchant Premium Support' then 'Merchant Premium Support'
+                   when h.staffing_group = 'UET Churn Inbound' then 'UET Churn Inbound'
+                   when h.staffing_group = 'UET Churn Outbound' then 'UET Churn Outbound'
+                   when h.staffing_group in ('Merchant Proactive Support','Merchant Proactive Support (inactive)','Merchant Snowball') then 'Merchant Snowball'
+                else l.line_of_business_mapped end AS line_of_business
+             ,h.time_in AS hours_start
+             ,h.time_out AS hours_end
+             ,h.units
+             
+        FROM secure_brain_sharing.workday_time_tracking_data h
+            LEFT JOIN customer_obsession.dim_bliss_agent b
+                ON LOWER(h.email) = LOWER(b.email)
+           left join scorecard_dates t on h.time_in BETWEEN DATE(t.scorecard_month_start) AND CAST(concat(t.scorecard_month_end,' 23:59:59') AS TIMESTAMP)
+            LEFT JOIN commops.global_lob_mapping l
+                ON (case 
+                        WHEN h.staffing_group LIKE '% %' OR h.staffing_group LIKE '%Â%' THEN REPLACE(REPLACE(h.staffing_group,'â',' '),' ',' ')
+                        else h.staffing_group end) = l.original_activity_name
+                  AND l.month = coalesce(NULLIF('{{month}}',''),t.target_month)
+
+	    WHERE
+            TRUE
+            -- AND comm_ops_type = 'COE'
+            AND h.time_type = 'Available for Work: On Queue'
+            AND h.time_in BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+            AND h.staffing_group IS NOT NULL    
+            AND h.email LIKE '%@uber.com'
+            AND h.staffing_group IN ('UET Churn Inbound','UET Churn Outbound')
+    ),
+    
+    northam_workday AS (
+    
+        SELECT
+             DATE_TRUNC('{{time_interval}}', hours_start) AS datestamp
+            ,line_of_business
+            ,agent_uuid
+            ,agent_email
+        --    ,min(DATE_TRUNC('{{time_interval}}', hours_start)) OVER(PARTITION BY line_of_business) as first_mds_week
+            ,SUM(units) AS productive_hours
+    
+        FROM
+            northam_workday_database
+    
+        GROUP BY
+            1, 2, 3, 4 
+    ),
+
+    northam_ops AS (
+    
+        SELECT DISTINCT 
+             agent_email
+            ,line_of_business
+            ,date_id AS datestamp
+        
+        FROM northam_workday
+            CROSS JOIN (
+                SELECT DISTINCT DATE_TRUNC('{{time_interval}}', date_id) AS date_id
+                FROM dwh.dim_date
+                WHERE date_id BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+            ) AS d(date_id)
+   --     where date_id >= first_mds_week
+    ),
+
+    northam_full AS (
+    
+        SELECT DISTINCT
+             o.datestamp
+            ,o.agent_email
+            ,COALESCE(r.employee_name,CONCAT(a.first_name,' ',a.last_name)) AS agent_name
+            ,COALESCE(r.manager1_email,t.work_email) AS team_lead_email
+            ,COALESCE(r.manager1_name,CONCAT(t.first_name,' ',t.last_name)) AS team_lead_name
+            ,COALESCE(r.manager2_email,m.work_email) AS manager_email
+            ,COALESCE(r.manager2_name,CONCAT(m.first_name,' ',m.last_name)) AS manager_name
+            ,o.line_of_business
+            ,r.site_code
+
+        FROM northam_ops o
+        LEFT JOIN commops.coe_roster_snapshot r
+                ON LOWER(o.agent_email) = LOWER(r.work_email)
+                AND CAST(r.week AS DATE) = DATE_TRUNC('week', o.datestamp)
+        LEFT JOIN whober.qb_employees_view a ON a.work_email = o.agent_email 
+        LEFT JOIN whober.qb_employees_view t ON t.employee_id = a.manager_id
+        LEFT JOIN whober.qb_employees_view m ON m.employee_id = t.manager_id
+),
+    
+cph AS (
+
+    SELECT DISTINCT
+    
+        DATE_TRUNC('{{time_interval}}', CAST(ch.createddate AS TIMESTAMP)) AS datestamp,
+        ch.case_id,
+        esc.contact_id,
+        no.agent_email,
+        CASE 
+            WHEN LOWER(esc.origin_name) = 'pro-active support' THEN 'UET Churn Outbound'
+            WHEN LOWER(esc.origin_name) = 'us/can' OR esc.last_queue_code in ('US/CAN Reactive Churn','UberEats US/CAN CPP') THEN 'UET Churn Inbound'
+            ELSE ''
+        END AS line_of_business
+            
+    FROM commops_ai.fact_eats_salesforce_case_history ch
+    JOIN commops_ai.dim_eats_salesforce_case esc
+        ON ch.case_id = esc.ticket_uuid
+    JOIN eats_salesops.salesforce_user su
+        ON su.user_id = ch.initiator_uuid
+    JOIN northam_ops no
+        ON su.email = no.agent_email
+    
+    WHERE TRUE
+    AND CAST(ch.createddate AS TIMESTAMP) BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+    AND ch.field = 'status'
+    AND ch.value IN ('Closed: No Outreach','Closed: Resolved')
+    AND no.line_of_business IN ('UET Churn Inbound','UET Churn Outbound')
+),
+
+retention_database AS (
+
+    SELECT DISTINCT
+
+        DATE_TRUNC('{{time_interval}}', CAST(ch.createddate AS TIMESTAMP)) AS case_actioned_timestamp,
+        ch.case_id AS convertible_id,
+        no.agent_email,
+          CASE 
+            WHEN LOWER(esc.origin_name) = 'pro-active support' THEN 'UET Churn Outbound'
+            WHEN LOWER(esc.origin_name) = 'us/can' OR esc.last_queue_code in ('US/CAN Reactive Churn','UberEats US/CAN CPP') THEN 'UET Churn Inbound'
+            ELSE ''
+        END AS line_of_business,
+        CASE
+            WHEN DATE(fet.restaurant_accept_timestamp_utc) BETWEEN CAST(ch.createddate AS TIMESTAMP) AND CAST(NOW() AS TIMESTAMP)
+            THEN 'retained'
+        END AS retention
+
+    FROM commops_ai.fact_eats_salesforce_case_history ch
+        JOIN eats_salesops.salesforce_user su
+            ON su.user_id = ch.initiator_uuid
+        JOIN northam_ops no
+            ON su.email = no.agent_email
+        JOIN commops_ai.dim_eats_salesforce_case esc ON ch.case_id = esc.ticket_uuid
+         AND (esc.level_5_code = 'Provided Resolution' AND 
+        (esc.level_6_code IS NULL OR esc.level_6_code != 'Change of Ownership'))
+        LEFT JOIN eats_salesops.salesforce_account sa ON esc.account_id = COALESCE(sa.acc_id, sa.acc_parentid)
+        LEFT JOIN eds.fact_eats_trip fet ON COALESCE(esc.requester_uuid, sa.acc_rest_uuid) = fet.restaurant_uuid
+            AND CAST(fet.datestr AS TIMESTAMP) >= DATE('{{start_date}}') - INTERVAL '1' MONTH
+    
+    WHERE TRUE
+        AND CAST(ch.createddate AS TIMESTAMP) BETWEEN DATE('{{start_date}}') AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)
+        AND ch.field = 'status'
+        AND ch.value IN ('Closed: No Outreach','Closed: Resolved')
+        AND no.line_of_business IN ('UET Churn Inbound','UET Churn Outbound')
+    
+    GROUP BY
+        1,2,3,4,5
+),
+
+retained AS (
+
+    SELECT
+
+        case_actioned_timestamp,
+        convertible_id,
+        agent_email,
+        line_of_business,
+        retention
+        
+    FROM retention_database
+    
+    WHERE TRUE
+    AND retention IS NOT NULL
+),
+
+retention AS (
+
+    SELECT
+
+        case_actioned_timestamp,
+        convertible_id,
+        agent_email,
+        line_of_business,
+        retention
+        
+    FROM retention_database
+    
+    WHERE TRUE
+    AND convertible_id NOT IN (SELECT convertible_id FROM retained)
+    
+    UNION ALL
+    
+    SELECT
+    
+        rd.case_actioned_timestamp,
+        rd.convertible_id,
+        rd.agent_email,
+        rd.line_of_business,
+        rd.retention
+        
+    FROM retained r
+    JOIN retention_database rd ON r.convertible_id = rd.convertible_id
+    
+    WHERE TRUE
+    AND rd.retention IS NOT NULL
+)
+
+SELECT *
+
+FROM {{kpi}}
