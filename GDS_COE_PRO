@@ -8,7 +8,7 @@ WITH northam_workday_database as (
              ,(CASE 
                     when h.staffing_group in('BGC: Checkr', 'BGC: Checkr (inactive)', 'BGC Adjudication') then 'BGC Adjudication'
                     when h.staffing_group in('Elevated Direct Support', 'Elevated Direct Support (inactive)','Uber Direct Rx') then 'Uber Direct Rx'
-                    when h.staffing_group in('ECR USC') then 'ECR'
+                    -- when h.staffing_group in('ECR USC') then 'ECR'
                 ELSE h.staffing_group END) as line_of_business
              ,h.time_in AS hours_start
              ,h.time_out AS hours_end
@@ -23,8 +23,8 @@ WHERE
                          'BGC Adjudication',
                          'BGC: Checkr',
                          'Consumer Escalations',
-                         'ECR',
-                         'ECR USC',
+                        --  'ECR',
+                        --  'ECR USC',
                          'Elevated Direct Support',
                          'Elevated Direct Support (inactive)',
                          'Uber Direct Rx',
@@ -587,158 +587,158 @@ UNION ALL
     ),
 
     --ECR insights compliance metric 
-    internal_note_base_table AS (
-        SELECT
-            m.contact_id
-            ,dba.site_code
-            ,dba.site_name
-            ,dba.name agent_name
-            ,dba.email agent_email
-            ,CONCAT('https://bliss.uberinternal.com/contacts/',m.contact_id) contact_url
-            ,m.content
+--     internal_note_base_table AS (
+--         SELECT
+--             m.contact_id
+--             ,dba.site_code
+--             ,dba.site_name
+--             ,dba.name agent_name
+--             ,dba.email agent_email
+--             ,CONCAT('https://bliss.uberinternal.com/contacts/',m.contact_id) contact_url
+--             ,m.content
             
-            ,REGEXP_REPLACE(content,'(\r|\n)|<[^>]*>') content_cleaned
-            ,CAST(DATE_FORMAT(CAST(from_unixtime(m.created_at_epoch) AS TIMESTAMP) AT TIME ZONE 'US/Pacific','%Y-%m-%d %H:%i:%S') AS TIMESTAMP) note_created_time_pt
+--             ,REGEXP_REPLACE(content,'(\r|\n)|<[^>]*>') content_cleaned
+--             ,CAST(DATE_FORMAT(CAST(from_unixtime(m.created_at_epoch) AS TIMESTAMP) AT TIME ZONE 'US/Pacific','%Y-%m-%d %H:%i:%S') AS TIMESTAMP) note_created_time_pt
             
-        FROM 
-            dwh.hbo_message m 
-            INNER JOIN customer_obsession.dim_bliss_agent dba ON m.creator_id = dba.uuid  
-        WHERE TRUE
-            AND LOWER(m.content) LIKE '%cpp taxonomy v3 start%' 
-            AND DATE(m.datestr) BETWEEN date('{{start_date}}') and cast('{{end_date}} 23:59:59' as timestamp)
-            AND visibility = 'internal' 
-            AND is_duplicate = FALSE
+--         FROM 
+--             dwh.hbo_message m 
+--             INNER JOIN customer_obsession.dim_bliss_agent dba ON m.creator_id = dba.uuid  
+--         WHERE TRUE
+--             AND LOWER(m.content) LIKE '%cpp taxonomy v3 start%' 
+--             AND DATE(m.datestr) BETWEEN date('{{start_date}}') and cast('{{end_date}} 23:59:59' as timestamp)
+--             AND visibility = 'internal' 
+--             AND is_duplicate = FALSE
     
-    ),
+--     ),
     
-    --clean substring 
-    substring_table AS (
-        SELECT
-            *,
-            SUBSTRING(content_cleaned,STRPOS(content_cleaned,'#CPP Taxonomy v3 Start'),STRPOS(content_cleaned,'#CPP Taxonomy v3 End#')) note_content
-        FROM
-            internal_note_base_table
-    ),
+--     --clean substring 
+--     substring_table AS (
+--         SELECT
+--             *,
+--             SUBSTRING(content_cleaned,STRPOS(content_cleaned,'#CPP Taxonomy v3 Start'),STRPOS(content_cleaned,'#CPP Taxonomy v3 End#')) note_content
+--         FROM
+--             internal_note_base_table
+--     ),
     
-    --extract answers for each cpp question 
-    cpp_content AS (
-        SELECT 
-            contact_id
-            ,contact_url
-            ,DATE_TRUNC('day',note_created_time_pt) day_pt
-            ,DATE_TRUNC('week', note_created_time_pt) week_pt
-            ,site_code
-            ,site_name
-            ,agent_name
-            ,agent_email
+--     --extract answers for each cpp question 
+--     cpp_content AS (
+--         SELECT 
+--             contact_id
+--             ,contact_url
+--             ,DATE_TRUNC('day',note_created_time_pt) day_pt
+--             ,DATE_TRUNC('week', note_created_time_pt) week_pt
+--             ,site_code
+--             ,site_name
+--             ,agent_name
+--             ,agent_email
         
-            ,content raw_content
-            ,note_content
-            ,SUBSTRING(note_content, STRPOS(note_content, 'Q1: Is there a KB page / step available to address the user''s issue?*')+LENGTH('Q1: Is there a KB page / step available to address the user''s issue?*'), STRPOS(note_content, 'Q2')-(STRPOS(note_content, 'Q1: Is there a KB page / step available to address the user''s issue?*')+LENGTH('Q1: Is there a KB page / step available to address the user''s issue?*'))) q1
-            ,SUBSTRING(note_content, STRPOS(note_content, 'Q2: Is there a logical mistake on the KB page / step / circular logic creating agent confusion?*')+LENGTH('Q2: Is there a logical mistake on the KB page / step / circular logic creating agent confusion?*'), STRPOS(note_content, 'Q3')-(STRPOS(note_content, 'Q2: Is there a logical mistake on the KB page / step / circular logic creating agent confusion?*')+LENGTH('Q2: Is there a logical mistake on the KB page / step / circular logic creating agent confusion?*'))) q2 
-            ,SUBSTRING(note_content, STRPOS(note_content, 'Q3: Was the escalation caused due to a tag / note / R&A status on the user''s account?*')+LENGTH('Q3: Was the escalation caused due to a tag / note / R&A status on the user''s account?*'), STRPOS(note_content, 'Q4')-(STRPOS(note_content, 'Q3: Was the escalation caused due to a tag / note / R&A status on the user''s account?*')+LENGTH('Q3: Was the escalation caused due to a tag / note / R&A status on the user''s account?*'))) q3    
-            ,SUBSTRING(note_content, STRPOS(note_content, 'Q4: Are the available talking points / saved replies not answering the user''s question and/or misses essential explanation?*')+LENGTH('Q4: Are the available talking points / saved replies not answering the user''s question and/or misses essential explanation?*'), STRPOS(note_content, 'Q5')-(STRPOS(note_content, 'Q4: Are the available talking points / saved replies not answering the user''s question and/or misses essential explanation?*')+LENGTH('Q4: Are the available talking points / saved replies not answering the user''s question and/or misses essential explanation?*'))) q4
-            ,SUBSTRING(note_content, STRPOS(note_content, 'Q5: Did any previous agent document they could not resolve due to a tools error?*')+LENGTH('Q5: Did any previous agent document they could not resolve due to a tools error?*'), STRPOS(note_content, 'Q6')-(STRPOS(note_content, 'Q5: Did any previous agent document they could not resolve due to a tools error?*')+LENGTH('Q5: Did any previous agent document they could not resolve due to a tools error?*'))) q5 
-            ,SUBSTRING(note_content, STRPOS(note_content, 'Q6: Did any previous agent document that they do not have the access required to solve the user''s issue?*')+LENGTH('Q6: Did any previous agent document that they do not have the access required to solve the user''s issue?*'), STRPOS(note_content, 'Q7')-(STRPOS(note_content, 'Q6: Did any previous agent document that they do not have the access required to solve the user''s issue?*')+LENGTH('Q6: Did any previous agent document that they do not have the access required to solve the user''s issue?*'))) q6 
-            ,SUBSTRING(note_content, STRPOS(note_content, 'Q7: Did any previous agent(s) apply the incorrect resolution as per the KB?*')+LENGTH('Q7: Did any previous agent(s) apply the incorrect resolution as per the KB?*'), STRPOS(note_content, 'Q8')-(STRPOS(note_content, 'Q7: Did any previous agent(s) apply the incorrect resolution as per the KB?*')+LENGTH('Q7: Did any previous agent(s) apply the incorrect resolution as per the KB?*'))) q7 
-            ,SUBSTRING(note_content, STRPOS(note_content, 'Q8: Did all previous agent(s) communicate the resolution as per guidelines?*')+LENGTH('Q8: Did all previous agent(s) communicate the resolution as per guidelines?*'), STRPOS(note_content, 'Q9')-(STRPOS(note_content, 'Q8: Did all previous agent(s) communicate the resolution as per guidelines?*')+LENGTH('Q8: Did all previous agent(s) communicate the resolution as per guidelines?*'))) q8 
-            ,SUBSTRING(note_content, STRPOS(note_content, 'Q9: Is the user pushing back on the outcome of the support interaction?*')+LENGTH('Q9: Is the user pushing back on the outcome of the support interaction?*'), STRPOS(note_content, 'Q10')-(STRPOS(note_content, 'Q9: Is the user pushing back on the outcome of the support interaction?*')+LENGTH('Q9: Is the user pushing back on the outcome of the support interaction?*'))) q9
-            ,SUBSTRING(note_content, STRPOS(note_content, 'Q10: Was the escalation caused by the user experiencing a bug or missing functionality on the app?*')+LENGTH('Q10: Was the escalation caused by the user experiencing a bug or missing functionality on the app?*'), STRPOS(note_content, '[REQUIRED] If YES to Q10, paste the link to the OC / KI')-(STRPOS(note_content, 'Q10: Was the escalation caused by the user experiencing a bug or missing functionality on the app?*')+LENGTH('Q10: Was the escalation caused by the user experiencing a bug or missing functionality on the app?*'))) q10 
-            ,SUBSTRING(note_content, STRPOS(note_content, '[REQUIRED] If YES to Q10, paste the link to the OC / KI')+LENGTH('[REQUIRED] If YES to Q10, paste the link to the OC / KI'), STRPOS(note_content, 'Q11')-(STRPOS(note_content, '[REQUIRED] If YES to Q10, paste the link to the OC / KI')+LENGTH('[REQUIRED] If YES to Q10, paste the link to the OC / KI'))) oc_ki
-            ,SUBSTRING(note_content, STRPOS(note_content, 'Q11: Was the escalation caused because the resolution took longer than a previous agent told the user it would?*')+LENGTH('Q11: Was the escalation caused because the resolution took longer than a previous agent told the user it would?*'), STRPOS(note_content, '[REQUIRED] What did you do?*')-(STRPOS(note_content, 'Q11: Was the escalation caused because the resolution took longer than a previous agent told the user it would?*')+LENGTH('Q11: Was the escalation caused because the resolution took longer than a previous agent told the user it would?*'))) q11 
-            ,SUBSTRING(note_content, STRPOS(note_content, '[REQUIRED] What did you do?*')+LENGTH('[REQUIRED] What did you do?*'), STRPOS(note_content, '[OPTIONAL] Please mention any other insights')-(STRPOS(note_content, '[REQUIRED] What did you do?*')+LENGTH('[REQUIRED] What did you do?*'))) action_taken
-            ,SUBSTRING(note_content, STRPOS(note_content, '[OPTIONAL] Please mention any other insights you believe will be helpful for improving support logic and processes.')+LENGTH('[OPTIONAL] Please mention any other insights you believe will be helpful for improving support logic and processes.'), STRPOS(note_content, '#CPP Taxonomy v3 End#')-(STRPOS(note_content, '[OPTIONAL] Please mention any other insights you believe will be helpful for improving support logic and processes.')+LENGTH('[OPTIONAL] Please mention any other insights you believe will be helpful for improving support logic and processes.'))) optional
-        FROM 
-            substring_table
-    ),
+--             ,content raw_content
+--             ,note_content
+--             ,SUBSTRING(note_content, STRPOS(note_content, 'Q1: Is there a KB page / step available to address the user''s issue?*')+LENGTH('Q1: Is there a KB page / step available to address the user''s issue?*'), STRPOS(note_content, 'Q2')-(STRPOS(note_content, 'Q1: Is there a KB page / step available to address the user''s issue?*')+LENGTH('Q1: Is there a KB page / step available to address the user''s issue?*'))) q1
+--             ,SUBSTRING(note_content, STRPOS(note_content, 'Q2: Is there a logical mistake on the KB page / step / circular logic creating agent confusion?*')+LENGTH('Q2: Is there a logical mistake on the KB page / step / circular logic creating agent confusion?*'), STRPOS(note_content, 'Q3')-(STRPOS(note_content, 'Q2: Is there a logical mistake on the KB page / step / circular logic creating agent confusion?*')+LENGTH('Q2: Is there a logical mistake on the KB page / step / circular logic creating agent confusion?*'))) q2 
+--             ,SUBSTRING(note_content, STRPOS(note_content, 'Q3: Was the escalation caused due to a tag / note / R&A status on the user''s account?*')+LENGTH('Q3: Was the escalation caused due to a tag / note / R&A status on the user''s account?*'), STRPOS(note_content, 'Q4')-(STRPOS(note_content, 'Q3: Was the escalation caused due to a tag / note / R&A status on the user''s account?*')+LENGTH('Q3: Was the escalation caused due to a tag / note / R&A status on the user''s account?*'))) q3    
+--             ,SUBSTRING(note_content, STRPOS(note_content, 'Q4: Are the available talking points / saved replies not answering the user''s question and/or misses essential explanation?*')+LENGTH('Q4: Are the available talking points / saved replies not answering the user''s question and/or misses essential explanation?*'), STRPOS(note_content, 'Q5')-(STRPOS(note_content, 'Q4: Are the available talking points / saved replies not answering the user''s question and/or misses essential explanation?*')+LENGTH('Q4: Are the available talking points / saved replies not answering the user''s question and/or misses essential explanation?*'))) q4
+--             ,SUBSTRING(note_content, STRPOS(note_content, 'Q5: Did any previous agent document they could not resolve due to a tools error?*')+LENGTH('Q5: Did any previous agent document they could not resolve due to a tools error?*'), STRPOS(note_content, 'Q6')-(STRPOS(note_content, 'Q5: Did any previous agent document they could not resolve due to a tools error?*')+LENGTH('Q5: Did any previous agent document they could not resolve due to a tools error?*'))) q5 
+--             ,SUBSTRING(note_content, STRPOS(note_content, 'Q6: Did any previous agent document that they do not have the access required to solve the user''s issue?*')+LENGTH('Q6: Did any previous agent document that they do not have the access required to solve the user''s issue?*'), STRPOS(note_content, 'Q7')-(STRPOS(note_content, 'Q6: Did any previous agent document that they do not have the access required to solve the user''s issue?*')+LENGTH('Q6: Did any previous agent document that they do not have the access required to solve the user''s issue?*'))) q6 
+--             ,SUBSTRING(note_content, STRPOS(note_content, 'Q7: Did any previous agent(s) apply the incorrect resolution as per the KB?*')+LENGTH('Q7: Did any previous agent(s) apply the incorrect resolution as per the KB?*'), STRPOS(note_content, 'Q8')-(STRPOS(note_content, 'Q7: Did any previous agent(s) apply the incorrect resolution as per the KB?*')+LENGTH('Q7: Did any previous agent(s) apply the incorrect resolution as per the KB?*'))) q7 
+--             ,SUBSTRING(note_content, STRPOS(note_content, 'Q8: Did all previous agent(s) communicate the resolution as per guidelines?*')+LENGTH('Q8: Did all previous agent(s) communicate the resolution as per guidelines?*'), STRPOS(note_content, 'Q9')-(STRPOS(note_content, 'Q8: Did all previous agent(s) communicate the resolution as per guidelines?*')+LENGTH('Q8: Did all previous agent(s) communicate the resolution as per guidelines?*'))) q8 
+--             ,SUBSTRING(note_content, STRPOS(note_content, 'Q9: Is the user pushing back on the outcome of the support interaction?*')+LENGTH('Q9: Is the user pushing back on the outcome of the support interaction?*'), STRPOS(note_content, 'Q10')-(STRPOS(note_content, 'Q9: Is the user pushing back on the outcome of the support interaction?*')+LENGTH('Q9: Is the user pushing back on the outcome of the support interaction?*'))) q9
+--             ,SUBSTRING(note_content, STRPOS(note_content, 'Q10: Was the escalation caused by the user experiencing a bug or missing functionality on the app?*')+LENGTH('Q10: Was the escalation caused by the user experiencing a bug or missing functionality on the app?*'), STRPOS(note_content, '[REQUIRED] If YES to Q10, paste the link to the OC / KI')-(STRPOS(note_content, 'Q10: Was the escalation caused by the user experiencing a bug or missing functionality on the app?*')+LENGTH('Q10: Was the escalation caused by the user experiencing a bug or missing functionality on the app?*'))) q10 
+--             ,SUBSTRING(note_content, STRPOS(note_content, '[REQUIRED] If YES to Q10, paste the link to the OC / KI')+LENGTH('[REQUIRED] If YES to Q10, paste the link to the OC / KI'), STRPOS(note_content, 'Q11')-(STRPOS(note_content, '[REQUIRED] If YES to Q10, paste the link to the OC / KI')+LENGTH('[REQUIRED] If YES to Q10, paste the link to the OC / KI'))) oc_ki
+--             ,SUBSTRING(note_content, STRPOS(note_content, 'Q11: Was the escalation caused because the resolution took longer than a previous agent told the user it would?*')+LENGTH('Q11: Was the escalation caused because the resolution took longer than a previous agent told the user it would?*'), STRPOS(note_content, '[REQUIRED] What did you do?*')-(STRPOS(note_content, 'Q11: Was the escalation caused because the resolution took longer than a previous agent told the user it would?*')+LENGTH('Q11: Was the escalation caused because the resolution took longer than a previous agent told the user it would?*'))) q11 
+--             ,SUBSTRING(note_content, STRPOS(note_content, '[REQUIRED] What did you do?*')+LENGTH('[REQUIRED] What did you do?*'), STRPOS(note_content, '[OPTIONAL] Please mention any other insights')-(STRPOS(note_content, '[REQUIRED] What did you do?*')+LENGTH('[REQUIRED] What did you do?*'))) action_taken
+--             ,SUBSTRING(note_content, STRPOS(note_content, '[OPTIONAL] Please mention any other insights you believe will be helpful for improving support logic and processes.')+LENGTH('[OPTIONAL] Please mention any other insights you believe will be helpful for improving support logic and processes.'), STRPOS(note_content, '#CPP Taxonomy v3 End#')-(STRPOS(note_content, '[OPTIONAL] Please mention any other insights you believe will be helpful for improving support logic and processes.')+LENGTH('[OPTIONAL] Please mention any other insights you believe will be helpful for improving support logic and processes.'))) optional
+--         FROM 
+--             substring_table
+--     ),
     
-    --clean answers and mark questions that were not answered with -1
-    cpp_cleaned AS (
-        SELECT 
-            contact_id
-            ,day_pt
-            ,week_pt
-            ,contact_url
-            ,site_code
-            ,site_name
-            ,agent_name
-            ,agent_email
-            ,CASE WHEN q1 LIKE '%No%' THEN 1 
-                  WHEN q1 LIKE '%Yes%' THEN 0
-                  ELSE -1 END process 
-            ,CASE WHEN q2 LIKE '%Yes%' THEN 1 
-                  WHEN q2 LIKE '%No%' THEN 0 
-                  ELSE -1 END support_logic
-            ,CASE WHEN q3 LIKE '%Yes, and the risk rule needs reconsideration%' THEN 1 
-                  WHEN q3 LIKE '%Yes, but the risk rule does NOT need reconsideration%' OR q3 LIKE '%No%' THEN 0 
-                  ELSE -1 END risk_support 
-            ,CASE WHEN q4 LIKE '%Yes%' THEN 1 
-                  WHEN q4 LIKE '%No%' THEN 0
-                  ELSE -1 END content 
-            ,CASE WHEN q5 LIKE '%Yes%' THEN 1 
-                  WHEN q5 LIKE '%No%' THEN 0 
-                  ELSE -1 END agent_tools
-            ,CASE WHEN q6 LIKE '%Yes%' THEN 1 
-                  WHEN q6 LIKE '%No%' THEN 0
-                  ELSE -1 END tooling_access 
-            ,CASE WHEN q7 LIKE '%Yes%' THEN 1 
-                  WHEN q7 LIKE '%No%' THEN 0 
-                  ELSE -1 END agent_error
-            ,CASE WHEN q8 LIKE '%No%' THEN 1
-                  WHEN q8 LIKE '%Yes%' THEN 0 
-                  ELSE -1 END agent_communication
-            ,CASE WHEN q9 LIKE '%Yes, and the policy needs reconsideration%' THEN 1 
-                  WHEN q9 LIKE '%Yes, but the policy does NOT need reconsideration%' OR q9 LIKE '%No%' THEN 0 
-                  ELSE -1 END policy
-            ,CASE WHEN q10 LIKE '%Yes%' THEN 1 
-                  WHEN q10 LIKE '%No%' THEN 0 
-                  ELSE -1 END bug_or_app_function
-            ,oc_ki
-            ,CASE WHEN q11 LIKE '%Yes%' THEN 1 
-                  WHEN q11 LIKE '%No%' THEN 0 
-                  ELSE -1 END unmet_sla
-            ,CASE WHEN action_taken LIKE '%I NRNed%' THEN 'I NRNed'
-                  WHEN action_taken LIKE '%I escalated further%' THEN 'I escalated further'
-                  WHEN action_taken LIKE '%I adjusted the user''s account (status, tags, notes, etc.)%' THEN 'I adjusted the user''s account (status, tags, notes, etc.)'
-                  WHEN action_taken LIKE '%I made a fare adjustment or refund%' THEN 'I made a fare adjustment or refund'
-                  WHEN action_taken LIKE '%I applied a misc. payment%' THEN 'I applied a misc. payment'
-                  WHEN action_taken LIKE '%I free-handed a response or modified part of a saved reply%' THEN 'I free-handed a response or modified part of a saved reply'
-                  WHEN action_taken LIKE '%I responded using a saved reply and did NOT make modifications%' THEN 'I responded using a saved reply and did NOT make modifications'
-                  ELSE null END action
-            ,REPLACE(optional, 'Optional - Addtl. Insight:') optional
+--     --clean answers and mark questions that were not answered with -1
+--     cpp_cleaned AS (
+--         SELECT 
+--             contact_id
+--             ,day_pt
+--             ,week_pt
+--             ,contact_url
+--             ,site_code
+--             ,site_name
+--             ,agent_name
+--             ,agent_email
+--             ,CASE WHEN q1 LIKE '%No%' THEN 1 
+--                   WHEN q1 LIKE '%Yes%' THEN 0
+--                   ELSE -1 END process 
+--             ,CASE WHEN q2 LIKE '%Yes%' THEN 1 
+--                   WHEN q2 LIKE '%No%' THEN 0 
+--                   ELSE -1 END support_logic
+--             ,CASE WHEN q3 LIKE '%Yes, and the risk rule needs reconsideration%' THEN 1 
+--                   WHEN q3 LIKE '%Yes, but the risk rule does NOT need reconsideration%' OR q3 LIKE '%No%' THEN 0 
+--                   ELSE -1 END risk_support 
+--             ,CASE WHEN q4 LIKE '%Yes%' THEN 1 
+--                   WHEN q4 LIKE '%No%' THEN 0
+--                   ELSE -1 END content 
+--             ,CASE WHEN q5 LIKE '%Yes%' THEN 1 
+--                   WHEN q5 LIKE '%No%' THEN 0 
+--                   ELSE -1 END agent_tools
+--             ,CASE WHEN q6 LIKE '%Yes%' THEN 1 
+--                   WHEN q6 LIKE '%No%' THEN 0
+--                   ELSE -1 END tooling_access 
+--             ,CASE WHEN q7 LIKE '%Yes%' THEN 1 
+--                   WHEN q7 LIKE '%No%' THEN 0 
+--                   ELSE -1 END agent_error
+--             ,CASE WHEN q8 LIKE '%No%' THEN 1
+--                   WHEN q8 LIKE '%Yes%' THEN 0 
+--                   ELSE -1 END agent_communication
+--             ,CASE WHEN q9 LIKE '%Yes, and the policy needs reconsideration%' THEN 1 
+--                   WHEN q9 LIKE '%Yes, but the policy does NOT need reconsideration%' OR q9 LIKE '%No%' THEN 0 
+--                   ELSE -1 END policy
+--             ,CASE WHEN q10 LIKE '%Yes%' THEN 1 
+--                   WHEN q10 LIKE '%No%' THEN 0 
+--                   ELSE -1 END bug_or_app_function
+--             ,oc_ki
+--             ,CASE WHEN q11 LIKE '%Yes%' THEN 1 
+--                   WHEN q11 LIKE '%No%' THEN 0 
+--                   ELSE -1 END unmet_sla
+--             ,CASE WHEN action_taken LIKE '%I NRNed%' THEN 'I NRNed'
+--                   WHEN action_taken LIKE '%I escalated further%' THEN 'I escalated further'
+--                   WHEN action_taken LIKE '%I adjusted the user''s account (status, tags, notes, etc.)%' THEN 'I adjusted the user''s account (status, tags, notes, etc.)'
+--                   WHEN action_taken LIKE '%I made a fare adjustment or refund%' THEN 'I made a fare adjustment or refund'
+--                   WHEN action_taken LIKE '%I applied a misc. payment%' THEN 'I applied a misc. payment'
+--                   WHEN action_taken LIKE '%I free-handed a response or modified part of a saved reply%' THEN 'I free-handed a response or modified part of a saved reply'
+--                   WHEN action_taken LIKE '%I responded using a saved reply and did NOT make modifications%' THEN 'I responded using a saved reply and did NOT make modifications'
+--                   ELSE null END action
+--             ,REPLACE(optional, 'Optional - Addtl. Insight:') optional
           
-        FROM 
-            cpp_content
-    ),
+--         FROM 
+--             cpp_content
+--     ),
     
-    --add false positive cpp and mark submissions as valid based on whether all questions were answered
-    valid AS (
-        SELECT 
-            *, 
-            CASE WHEN agent_communication=1 OR agent_error =1 THEN 1 ELSE 0 END agent_bucket,
-            CASE WHEN content =1 OR support_logic = 1 THEN 1 ELSE 0 END content_bucket,
-            CASE WHEN tooling_access =1 OR policy =1 THEN 1 ELSE 0 END policy_bucket, 
-            CASE WHEN unmet_sla = 1 OR process = 1 THEN 1 ELSE 0 END process_bucket, 
-            CASE WHEN bug_or_app_function = 1 OR agent_tools = 1 THEN 1 ELSE 0 END product_bucket, 
-            CASE WHEN risk_support = 1 THEN 1 ELSE 0 END risk_flag_bucket,
-            CASE WHEN process = 0 AND support_logic = 0 AND risk_support = 0 AND content = 0 AND agent_tools = 0 AND tooling_access = 0 AND agent_error = 0 AND agent_communication = 0 AND policy = 0 AND bug_or_app_function =0 AND unmet_sla = 0 THEN 1 ELSE 0 END false_positive
-            ,CASE WHEN (bug_or_app_function = 1 AND LENGTH(oc_ki) < 8) OR process = -1 OR support_logic = -1 OR risk_support = -1 OR content = -1 OR agent_tools = -1 OR tooling_access = -1 OR agent_error = -1 OR agent_communication = -1 OR policy = -1 OR bug_or_app_function = -1 OR unmet_sla = -1 OR action IS NULL THEN 0 ELSE 1 END all_q_answered
-        FROM 
-            cpp_cleaned
-    ),
+--     --add false positive cpp and mark submissions as valid based on whether all questions were answered
+--     valid AS (
+--         SELECT 
+--             *, 
+--             CASE WHEN agent_communication=1 OR agent_error =1 THEN 1 ELSE 0 END agent_bucket,
+--             CASE WHEN content =1 OR support_logic = 1 THEN 1 ELSE 0 END content_bucket,
+--             CASE WHEN tooling_access =1 OR policy =1 THEN 1 ELSE 0 END policy_bucket, 
+--             CASE WHEN unmet_sla = 1 OR process = 1 THEN 1 ELSE 0 END process_bucket, 
+--             CASE WHEN bug_or_app_function = 1 OR agent_tools = 1 THEN 1 ELSE 0 END product_bucket, 
+--             CASE WHEN risk_support = 1 THEN 1 ELSE 0 END risk_flag_bucket,
+--             CASE WHEN process = 0 AND support_logic = 0 AND risk_support = 0 AND content = 0 AND agent_tools = 0 AND tooling_access = 0 AND agent_error = 0 AND agent_communication = 0 AND policy = 0 AND bug_or_app_function =0 AND unmet_sla = 0 THEN 1 ELSE 0 END false_positive
+--             ,CASE WHEN (bug_or_app_function = 1 AND LENGTH(oc_ki) < 8) OR process = -1 OR support_logic = -1 OR risk_support = -1 OR content = -1 OR agent_tools = -1 OR tooling_access = -1 OR agent_error = -1 OR agent_communication = -1 OR policy = -1 OR bug_or_app_function = -1 OR unmet_sla = -1 OR action IS NULL THEN 0 ELSE 1 END all_q_answered
+--         FROM 
+--             cpp_cleaned
+--     ),
     
-  ecr_insights AS (
-        SELECT 
-            date_trunc('{{time_interval}}',day_pt) as datestamp,
-            site_code, 
-            agent_name, 
-            agent_email, 
-            CAST(COUNT(CASE WHEN all_q_answered = 1 THEN contact_id ELSE null END) AS DECIMAL(10,4)) valid_ct, 
-            CAST(COUNT(contact_id) AS DECIMAL(10,4)) all_contact_ct
-        FROM
-            valid
-        GROUP BY 1,2,3,4
-    ),
+--   ecr_insights AS (
+--         SELECT 
+--             date_trunc('{{time_interval}}',day_pt) as datestamp,
+--             site_code, 
+--             agent_name, 
+--             agent_email, 
+--             CAST(COUNT(CASE WHEN all_q_answered = 1 THEN contact_id ELSE null END) AS DECIMAL(10,4)) valid_ct, 
+--             CAST(COUNT(contact_id) AS DECIMAL(10,4)) all_contact_ct
+--         FROM
+--             valid
+--         GROUP BY 1,2,3,4
+--     ),
         
 -- UET Salesforce Data
 uet_agents AS (     
@@ -1257,9 +1257,9 @@ UNION ALL
         qa.datestamp,
         qa.agent_sc_score AS qa_score,
         qa.qa_ticket
-        	
+            
         FROM (
-              SELECT DISTINCT SUBSTRING(SPLIT(ticket_link, '/')[CARDINALITY(SPLIT(ticket_link, '/'))], 1, STRPOS(SPLIT(ticket_link, '/')[CARDINALITY(SPLIT(ticket_link, '/'))], ')') - 1) AS qa_ticket,	
+              SELECT DISTINCT SUBSTRING(SPLIT(ticket_link, '/')[CARDINALITY(SPLIT(ticket_link, '/'))], 1, STRPOS(SPLIT(ticket_link, '/')[CARDINALITY(SPLIT(ticket_link, '/'))], ')') - 1) AS qa_ticket, 
               CAST(review_week AS TIMESTAMP) AS datestamp,
               agent_email,
               agent_sc_score
@@ -1267,10 +1267,10 @@ UNION ALL
               FROM commops.coe_global_spotcheck_qa qa
               
               WHERE TRUE
-              AND CAST(review_date AS TIMESTAMP) BETWEEN CAST('{{start_date}}' AS TIMESTAMP) AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP)	
-              AND site_code IN('COE_UBR_CHI','COE_UBR_PHX','COE_UBR_NSH')	
+              AND CAST(review_date AS TIMESTAMP) BETWEEN CAST('{{start_date}}' AS TIMESTAMP) AND CAST('{{end_date}} 23:59:59' AS TIMESTAMP) 
+              AND site_code IN('COE_UBR_CHI','COE_UBR_PHX','COE_UBR_NSH')   
              ) qa
-    	
+        
 UNION ALL
     
     SELECT -- non-standard QA sources: https://docs.google.com/spreadsheets/d/1ZZHDkaVBPxnPF-cvbUtYwAkuf-Jns8-mfyozfwh5Qak/edit#gid=0
@@ -1381,50 +1381,50 @@ SELECT DISTINCT
         ,CASE -- Efficiency Primary (KPI 1)
             WHEN o.line_of_business IN('U4B: Premium Support','UET Churn Inbound','UET Churn Outbound') THEN '(Salesforce) Cases per Hour'
             WHEN o.line_of_business IN('Uber Health Premium Support') THEN 'Tickets per Hour'
-            WHEN o.line_of_business IN('ECR','Merchant C360','SAFE Project Specialist') THEN 'Jiras per Hour'
+            WHEN o.line_of_business IN('Merchant C360','SAFE Project Specialist') THEN 'Jiras per Hour'
             when o.line_of_business in('BGC Adjudication') then 'Cases per Hour'
             when o.line_of_business in('Uber Direct Rx') then 'Tickets per Hour'
             ELSE 'Efficiency Primary [Not Applicable]' END AS eff_1_type
         ,CASE
             WHEN o.line_of_business IN('Uber Health Premium Support') THEN 'Tickets Solved'
-            WHEN o.line_of_business IN('ECR','Merchant C360','SAFE Project Specialist','U4B: Premium Support') THEN 'Cases Solved'
+            WHEN o.line_of_business IN('Merchant C360','SAFE Project Specialist','U4B: Premium Support') THEN 'Cases Solved'
             when o.line_of_business in('BGC Adjudication') then 'Checkr Solved'
             when o.line_of_business in('Uber Direct Rx') then 'Tickets Solved'
             ELSE ''
             END AS eff_1_type_n
         ,CASE
-            WHEN o.line_of_business IN('BGC Adjudication','ECR','Merchant C360','SAFE Project Specialist','Uber Health Premium Support','U4B: Premium Support','Uber Direct Rx') THEN 'Productive Hours'
+            WHEN o.line_of_business IN('BGC Adjudication','Merchant C360','SAFE Project Specialist','Uber Health Premium Support','U4B: Premium Support','Uber Direct Rx') THEN 'Productive Hours'
             ELSE ''
             END AS eff_1_type_d
         ,CASE
             WHEN w.productive_hours > 0 AND o.line_of_business IN('Consumer Escalations') THEN COALESCE(a2.bliss_actions, 0)
             WHEN w.productive_hours > 0 AND o.line_of_business IN('Uber Health','Uber Health Premium Support') THEN COALESCE(h.cases, 0)
-            WHEN w.productive_hours > 0 AND o.line_of_business IN('ECR','Merchant C360','SAFE Project Specialist') THEN COALESCE(j.jira, 0)
+            WHEN w.productive_hours > 0 AND o.line_of_business IN('Merchant C360','SAFE Project Specialist') THEN COALESCE(j.jira, 0)
             WHEN w.productive_hours > 0 AND o.line_of_business IN('U4B: Premium Support') THEN COALESCE(u.sfdc_cases, 0)
             when w.productive_hours > 0 and o.line_of_business in('BGC Adjudication') then coalesce(b.adjudications,0)
             when w.productive_hours > 0 and o.line_of_business in('Uber Direct Rx') then coalesce(h.cases, 0)
             ELSE 0 END AS eff_1_n
         ,CASE
-            WHEN o.line_of_business IN('BGC Adjudication','Consumer Escalations','ECR','Merchant C360','SAFE Project Specialist','Uber Health Premium Support','U4B: Premium Support','Uber Direct Rx') THEN COALESCE(productive_hours, 0)
+            WHEN o.line_of_business IN('BGC Adjudication','Consumer Escalations','Merchant C360','SAFE Project Specialist','Uber Health Premium Support','U4B: Premium Support','Uber Direct Rx') THEN COALESCE(productive_hours, 0)
             END AS eff_1_d
-        ,CASE -- Efficiency Secondary (KPI 2)
-            when o.line_of_business in('ECR') then 'Insight Compliance Rate'
-            ELSE 'Efficiency Secondary [Not Applicable]'
-            END AS eff_2_type
-        ,CASE
-            when o.line_of_business in('ECR') then 'Valid Contacts'
-            ELSE ''
-            END AS eff_2_type_n
-        ,CASE
-            when o.line_of_business in('ECR') then 'Total Contacts'
-            ELSE ''
-            END AS eff_2_type_d
-        ,CASE
-            when o.line_of_business in('ECR') then coalesce(ecr.valid_ct, 0)
-            ELSE 0 END AS eff_2_n
-        ,CASE
-            when o.line_of_business in('ECR') then coalesce(ecr.all_contact_ct, 0)
-            ELSE 0 END AS eff_2_d
+        -- ,CASE -- Efficiency Secondary (KPI 2)
+        --     when o.line_of_business in('ECR') then 'Insight Compliance Rate'
+        --     ELSE 'Efficiency Secondary [Not Applicable]'
+        --     END AS eff_2_type
+        -- ,CASE
+        --     when o.line_of_business in('ECR') then 'Valid Contacts'
+        --     ELSE ''
+        --     END AS eff_2_type_n
+        -- ,CASE
+        --     when o.line_of_business in('ECR') then 'Total Contacts'
+        --     ELSE ''
+        --     END AS eff_2_type_d
+        -- ,CASE
+        --     when o.line_of_business in('ECR') then coalesce(ecr.valid_ct, 0)
+        --     ELSE 0 END AS eff_2_n
+        -- ,CASE
+        --     when o.line_of_business in('ECR') then coalesce(ecr.all_contact_ct, 0)
+        --     ELSE 0 END AS eff_2_d
         ,CASE -- CSAT Primary (KPI 3)
             WHEN o.line_of_business IN('Merchant C360') THEN 'JIRA CSAT'
             WHEN o.line_of_business IN('U4B: Premium Support','Uber Health Premium Support','Uber Direct Rx') THEN 'CSAT (Salesforce)'
@@ -1466,19 +1466,19 @@ SELECT DISTINCT
             
            
         ,CASE --Quality Audits Primary (KPI 5)
-            WHEN o.line_of_business IN('BGC Adjudication','ECR','Uber Health Premium Support','U4B: Premium Support','Uber Direct Rx') THEN 'Quality Score'
+            WHEN o.line_of_business IN('BGC Adjudication','Uber Health Premium Support','U4B: Premium Support','Uber Direct Rx') THEN 'Quality Score'
             ELSE 'Quality Audits Primary [Not Applicable]' END AS qa_1_type
         ,CASE
-            WHEN o.line_of_business IN('BGC Adjudication','ECR','Uber Health Premium Support','U4B: Premium Support','Uber Direct Rx') THEN 'Sum of Quality Scores'
+            WHEN o.line_of_business IN('BGC Adjudication','Uber Health Premium Support','U4B: Premium Support','Uber Direct Rx') THEN 'Sum of Quality Scores'
             ELSE '' END AS qa_1_type_n
         ,CASE
-            WHEN o.line_of_business IN('BGC Adjudication','ECR','Uber Health Premium Support','U4B: Premium Support','Uber Direct Rx') THEN 'Quality Audits'
+            WHEN o.line_of_business IN('BGC Adjudication','Uber Health Premium Support','U4B: Premium Support','Uber Direct Rx') THEN 'Quality Audits'
             ELSE '' END AS qa_1_type_d
         ,CASE
-            WHEN o.line_of_business IN('BGC Adjudication','ECR','Uber Health Premium Support','U4B: Premium Support','Uber Direct Rx') THEN COALESCE(q.qa_sum,0)
+            WHEN o.line_of_business IN('BGC Adjudication','Uber Health Premium Support','U4B: Premium Support','Uber Direct Rx') THEN COALESCE(q.qa_sum,0)
             ELSE 0 END AS qa_1_n
         ,CASE
-            WHEN o.line_of_business IN('BGC Adjudication','ECR','Uber Health Premium Support','U4B: Premium Support','Uber Direct Rx') THEN COALESCE(q.qa_count,0)
+            WHEN o.line_of_business IN('BGC Adjudication','Uber Health Premium Support','U4B: Premium Support','Uber Direct Rx') THEN COALESCE(q.qa_count,0)
             ELSE 0 END AS qa_1_d
 
     FROM
@@ -1528,5 +1528,5 @@ SELECT DISTINCT
             AND w.line_of_business = b.line_of_business
         LEFT JOIN qa_full q ON o.agent_email = q.agent_email
             AND o.datestamp = q.datestamp
-        left join ecr_insights ecr on ecr.agent_email = o.agent_email
-            and o.datestamp = ecr.datestamp
+        -- left join ecr_insights ecr on ecr.agent_email = o.agent_email
+            -- and o.datestamp = ecr.datestamp
