@@ -18,6 +18,7 @@ WITH
                    when h.staffing_group = 'UET Churn Inbound' then 'UET Churn Inbound'
                    when h.staffing_group = 'UET Churn Outbound' then 'UET Churn Outbound'
                    when h.staffing_group = 'UET: FasTrack' then 'UET: FasTrack'
+                   when h.staffing_group = 'ECR USC' then 'ECR'
                    when h.staffing_group in ('Merchant Proactive Support','Merchant Proactive Support (inactive)','Merchant Snowball') then 'Merchant Snowball'
                 else l.line_of_business_mapped end AS line_of_business
              ,h.time_in AS hours_start
@@ -42,7 +43,7 @@ WITH
             AND h.staffing_group IS NOT NULL    
             AND h.email LIKE '%@uber.com'
             AND (l.region = 'US&C' or h.staffing_group in('Delivery Experience', 'UET Churn Inbound','UET Churn Outbound'))
-            AND (l.line_of_business_mapped NOT LIKE 'Non-MDS_%' or h.staffing_group in ('UET: FasTrack','Delivery Experience', 'UET Churn Inbound','UET Churn Outbound','Merchant Premium Support'))
+            AND (l.line_of_business_mapped NOT LIKE 'Non-MDS_%' or h.staffing_group in ('UET: FasTrack','Delivery Experience', 'UET Churn Inbound','UET Churn Outbound','Merchant Premium Support','ECR USC'))
             and (l.line_of_business_mapped != 'Consumer Escalations' and l.line_of_business_mapped != 'Eater Experience' or l.line_of_business_mapped is null)
     ),
     
@@ -489,6 +490,8 @@ WITH
         SELECT DISTINCT
              j.assignee AS agent_email
             ,DATE_FORMAT(DATE_TRUNC('{{time_interval}}', CAST(j.resolved AS TIMESTAMP)), '%Y-%m-%d') AS datestamp
+            ,j.resolved AS resolved_timestamp   
+            ,f.first_assigned_timestamp
             ,CASE
                 WHEN j.project = 'BGC' THEN 'BGC: JIRA' 
                 WHEN j.project = 'ECR' THEN 'ECR'
@@ -530,6 +533,7 @@ WITH
             JOIN customer_obsession.dim_bliss_agent a ON j.assignee = a.email
             LEFT JOIN commops_ai.dim_jira_cases_type t ON j.type_uuid = t.type_uuid
             LEFT JOIN (SELECT key, field, FIRST_VALUE(action_ts) OVER(PARTITION BY key ORDER BY action_ts) AS first_action_timestamp FROM commops_ai.fact_jira_actions WHERE field = 'assignee' AND project > '1') h ON j.key = h.key
+            LEFT JOIN (SELECT key, FIRST_VALUE(action_ts) OVER (PARTITION BY key ORDER BY action_ts) AS first_assigned_timestamp FROM commops_ai.fact_jira_actions WHERE project = 'ECR' AND field = 'assignee') f ON j.key = f.key
             LEFT JOIN (SELECT action_timestamp, ticket_uuid, initiator_uuid FROM customer_obsession.fact_bliss_action WHERE DATE(datestr) >= DATE('{{start_date}}') - INTERVAL '7' DAY AND type = 'update_status') a ON REGEXP_EXTRACT(j.contact,'[0-9A-Za-z]{8}-[0-9A-Za-z]{4}-[0-9A-Za-z]{4}-[0-9A-Za-z]{4}-[0-9A-Za-z]{12}') = a.ticket_uuid
             AND a.action_timestamp >= h.first_action_timestamp
             LEFT JOIN (SELECT DISTINCT ticket_uuid, survey_agent_uuid, FIRST_VALUE(survey_response) OVER (PARTITION BY ticket_uuid ORDER BY survey_response_timestamp DESC) AS survey_response FROM customer_obsession.fact_bliss_survey WHERE DATE(datestr) >= DATE('{{start_date}}') - INTERVAL '7' DAY AND survey_response IN('1','2','3','4','5')) s ON REGEXP_EXTRACT(j.contact,'[0-9A-Za-z]{8}-[0-9A-Za-z]{4}-[0-9A-Za-z]{4}-[0-9A-Za-z]{4}-[0-9A-Za-z]{12}') = s.ticket_uuid
@@ -546,7 +550,7 @@ WITH
             AND NOT (j.project = 'EFT' AND j.resolution = 'Rejected')
             
         GROUP BY
-            1, 2, 3, 4, 5, 6, 7, 8
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10
     ),
 
     jira AS (
@@ -558,6 +562,7 @@ WITH
               when line_of_business in ('Rider Account & Payment', 'Rider Trips','ASR', 'Recovery','Eater') or jira_type in ('Rider > UberRewards', 'Eater > UberRewards') then 'Rider C360'
               else line_of_business end as line_of_business
             ,COUNT(DISTINCT issue_key) AS jira
+            ,COUNT(CASE WHEN date_diff('day', first_assigned_timestamp, resolved_timestamp) <= 7 THEN 1 ELSE NULL END) as resolved_in_7_days
             ,SUM(survey_stars) AS bliss_jira_stars -- Bliss CSAT Scores
             ,COUNT(survey_stars) AS bliss_jira_surveys -- Bliss CSAT Survey Responses
             ,COUNT(CASE WHEN survey_stars = 1 THEN survey_stars END) AS bliss_jira_1_star -- Bliss 1-Star CSAT
@@ -1195,7 +1200,7 @@ SELECT DISTINCT
             WHEN o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations', 'UGO Specialized','Diamond Rider') THEN 'Average Handle Time'
             WHEN o.line_of_business IN('BGC: Checkr','Merchant Premium Support','Merchant Global Delivery Partner') THEN 'Cases per Hour'
             when o.line_of_business in('Uber Health') then 'Tickets per Hour'
-            WHEN o.line_of_business IN('ASR 360','BGC: JIRA','Driver C360','Rider C360','SAFE: RRT','SAFE: FP','SAFE: Triage','UET: FasTrack') THEN 'Jiras per Hour'
+            WHEN o.line_of_business IN('ASR 360','BGC: JIRA','Driver C360','Rider C360','SAFE: RRT','SAFE: FP','SAFE: Triage','UET: FasTrack','ECR') THEN 'Jiras per Hour'
             when o.line_of_business in('Delivery Experience') then 'Average Handle Time'
             WHEN o.line_of_business IN('HiPo SORT') THEN 'Cases per Hour'
             when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound') then 'Tickets per Hour'
@@ -1203,7 +1208,7 @@ SELECT DISTINCT
             ELSE 'Efficiency Primary [Not Applicable]' END AS eff_1_type
         ,CASE
             WHEN o.line_of_business IN('SAFE: Triage') THEN 'Cases Created'
-            WHEN o.line_of_business IN('BGC: JIRA','Driver C360','Rider C360','SAFE: RRT','SAFE: FP','SAFE: Triage','Merchant Premium Support','Merchant Global Delivery Partner','HiPo SORT','UET: FasTrack') THEN 'Cases Solved'
+            WHEN o.line_of_business IN('BGC: JIRA','Driver C360','Rider C360','SAFE: RRT','SAFE: FP','SAFE: Triage','Merchant Premium Support','Merchant Global Delivery Partner','HiPo SORT','UET: FasTrack','ECR') THEN 'Cases Solved'
             when o.line_of_business in('Uber Health') then 'Tickets Solved'
             WHEN o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations', 'UGO Specialized','Diamond Rider') THEN 'Phone Interaction Time'
             when o.line_of_business in('Delivery Experience') then 'Handle Time'
@@ -1213,11 +1218,11 @@ SELECT DISTINCT
         ,CASE
             WHEN o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations', 'UGO Specialized','Diamond Rider') THEN 'Phone Interactions'
             when o.line_of_business in('Delivery Experience') then 'Tickets Solved'
-            when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound','Merchant Premium Support','Merchant Global Delivery Partner','Merchant Snowball','HiPo SORT','UET: FasTrack') then 'Productive Hours'
+            when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound','Merchant Premium Support','Merchant Global Delivery Partner','Merchant Snowball','HiPo SORT','UET: FasTrack','ECR') then 'Productive Hours'
             ELSE 'Productive Hours'
             END AS eff_1_type_d
         ,CASE
-            WHEN w.productive_hours > 0 AND o.line_of_business IN('BGC: JIRA','Driver C360','Rider C360','UET: FasTrack') THEN COALESCE(j.jira, 0)
+            WHEN w.productive_hours > 0 AND o.line_of_business IN('BGC: JIRA','Driver C360','Rider C360','UET: FasTrack','ECR') THEN COALESCE(j.jira, 0)
             WHEN w.productive_hours > 0 AND o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations','UGO Specialized','Diamond Rider') THEN COALESCE(p.bliss_phone_time, 0)
             WHEN w.productive_hours > 0 AND o.line_of_business IN('SAFE: FP','SAFE: RRT','SAFE: Triage') THEN COALESCE(sj.jira, 0)
             when w.productive_hours > 0 and o.line_of_business in('Delivery Experience') then coalesce(ht.handle_time_mins, 0)
@@ -1231,7 +1236,7 @@ SELECT DISTINCT
             WHEN w.productive_hours > 0 AND o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations','UGO Specialized','Diamond Rider') THEN COALESCE(p.bliss_phone, 0)
             WHEN w.productive_hours > 0 AND o.line_of_business IN('SAFE: Triage') THEN COALESCE(w.productive_hours, 0) - COALESCE(CAST(t.otter_time_seconds AS DOUBLE)/3600, 0)
             when w.productive_hours > 0 and o.line_of_business in('Delivery Experience') then coalesce(a3.bliss_solves,0)
-            when w.productive_hours > 0 and o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound','Merchant Premium Support','Merchant Global Delivery Partner','Merchant Snowball','UET: FasTrack') then COALESCE(w.productive_hours, 0)
+            when w.productive_hours > 0 and o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound','Merchant Premium Support','Merchant Global Delivery Partner','Merchant Snowball','UET: FasTrack','ECR') then COALESCE(w.productive_hours, 0)
             ELSE COALESCE(productive_hours, 0)
             END AS eff_1_d
         ,CASE -- Efficiency Secondary (KPI 2)
@@ -1243,6 +1248,7 @@ SELECT DISTINCT
             when o.line_of_business in('UET: FasTrack') then 'Comments Per Hour'
             when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound') then 'Restaurant Retention 14D'
             when o.line_of_business in('Merchant Premium Support','Merchant Global Delivery Partner') then 'Actions Per Hour'
+            when o.line_of_business in('ECR') then '7 Day Resolution'
             ELSE 'Efficiency Secondary [Not Applicable]'
             END AS eff_2_type
         ,CASE
@@ -1254,6 +1260,7 @@ SELECT DISTINCT
             when o.line_of_business in('Merchant Premium Support','Merchant Global Delivery Partner') then 'Solve Actions, Emails, Calls'
             when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound') then 'Churn Prevented 14D'
             when o.line_of_business in('UET: FasTrack') then 'Comments'
+            when o.line_of_business in('ECR') then '7D Resolution Cases'
             ELSE ''
             END AS eff_2_type_n
         ,CASE
@@ -1261,6 +1268,7 @@ SELECT DISTINCT
             when o.line_of_business in('Delivery Experience','UET: FasTrack','Merchant Premium Support','Merchant Global Delivery Partner') then 'Productive Hours'
             when o.line_of_business in('Merchant Snowball') then 'Solve Actions'
             when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound') then 'Restaurants At Risk 14D'
+            when o.line_of_business in('ECR') then 'Cases Solved'
             ELSE ''
             END AS eff_2_type_d
         ,CASE
@@ -1272,6 +1280,7 @@ SELECT DISTINCT
             WHEN o.line_of_business IN('Merchant Premium Support','Merchant Global Delivery Partner') THEN COALESCE(m2.productive_actions, 0) + COALESCE(m2.email_count, 0) + COALESCE(s.call_count, 0)
             when o.line_of_business in ('UET Churn Inbound', 'UET Churn Outbound') then coalesce(c.conversion_n,0)
             when o.line_of_business in('UET: FasTrack') then COALESCE(ft.comments,0)
+            when o.line_of_business in('ECR') then COALESCE(j.resolved_in_7_days,0)
             ELSE 0 END AS eff_2_n
         ,CASE
             WHEN w.productive_hours > 0 and o.line_of_business IN('SAFE: Triage') THEN COALESCE(w.productive_hours, 0) - COALESCE(CAST(t.otter_time_seconds AS DOUBLE)/3600, 0)
@@ -1280,6 +1289,7 @@ SELECT DISTINCT
             when w.productive_hours > 0 and o.line_of_business in('Merchant Snowball') then coalesce(m2.solve_actions,0)
             when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound') then coalesce(c.conversion_d,0)
             WHEN o.line_of_business IN('UET: FasTrack') THEN COALESCE(w.productive_hours, 0)
+            WHEN o.line_of_business = 'ECR' THEN COALESCE(j.jira, 0)
             ELSE 0 END AS eff_2_d
         ,CASE -- CSAT Primary (KPI 3)
             WHEN o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations','UGO Specialized') THEN '1-Star CSAT'
@@ -1358,7 +1368,7 @@ SELECT DISTINCT
             when o.line_of_business in('Merchant Premium Support','Merchant Global Delivery Partner') then coalesce(m2.solve_actions,0)
             ELSE 0 END AS csat_2_d
         ,CASE --Quality Audit Primary (KPI 5)
-            WHEN o.line_of_business IN('SAFE: RRT','SAFE: FP','SAFE: Triage') THEN 'Quality Score'
+            WHEN o.line_of_business IN('SAFE: RRT','SAFE: FP','SAFE: Triage','ECR') THEN 'Quality Score'
             WHEN o.line_of_business IN('Driver Payment - Phone','Diamond Rider','Driver Phone Escalations') THEN 'Quality Score'
             WHEN o.line_of_business IN('Driver C360','Rider C360') THEN 'Quality Score'
             WHEN o.line_of_business IN('BGC: JIRA','BGC: Checkr') THEN 'Quality Score'
@@ -1368,7 +1378,7 @@ SELECT DISTINCT
             when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound','Merchant Premium Support','Merchant Snowball','UET: FasTrack') then 'Quality Score'
             ELSE 'Quality Audits Primary [Not Applicable]' END AS qa_1_type
         ,CASE
-            WHEN o.line_of_business IN('SAFE: RRT','SAFE: FP','SAFE: Triage','HiPo SORT') THEN 'Sum of Quality Scores'
+            WHEN o.line_of_business IN('SAFE: RRT','SAFE: FP','SAFE: Triage','HiPo SORT','ECR') THEN 'Sum of Quality Scores'
             WHEN o.line_of_business IN('Driver Payment - Phone','Diamond Rider','Driver Phone Escalations') THEN 'Sum of Quality Scores'
             WHEN o.line_of_business IN('Driver C360','Rider C360') THEN 'Sum of Quality Scores'
             WHEN o.line_of_business IN('BGC: JIRA','BGC: Checkr') THEN 'Sum of Quality Scores'
@@ -1377,7 +1387,7 @@ SELECT DISTINCT
             when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound','Merchant Premium Support','Merchant Snowball','UET: FasTrack') then 'Sum of Quality Scores'
             ELSE '' END AS qa_1_type_n
         ,CASE
-            WHEN o.line_of_business IN('SAFE: RRT','SAFE: FP','SAFE: Triage','HiPo SORT') THEN 'Quality Audits'
+            WHEN o.line_of_business IN('SAFE: RRT','SAFE: FP','SAFE: Triage','HiPo SORT','ECR') THEN 'Quality Audits'
             WHEN o.line_of_business IN('Driver Payment - Phone','Diamond Rider','Driver Phone Escalations') THEN 'Quality Audits'
             WHEN o.line_of_business IN('Driver C360','Rider C360') THEN 'Quality Audits'
             WHEN o.line_of_business IN('BGC: JIRA','BGC: Checkr') THEN 'Quality Audits'
@@ -1386,7 +1396,7 @@ SELECT DISTINCT
             when o.line_of_business in('UET Churn Inbound', 'UET Churn Outbound','Merchant Premium Support','Merchant Snowball') then 'Quality Audits'
             ELSE '' END AS qa_1_type_d
         ,CASE
-            WHEN o.line_of_business IN('SAFE: RRT','SAFE: FP','SAFE: Triage','HiPo SORT') THEN COALESCE(q.qa_sum, 0)
+            WHEN o.line_of_business IN('SAFE: RRT','SAFE: FP','SAFE: Triage','HiPo SORT','ECR') THEN COALESCE(q.qa_sum, 0)
             WHEN o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations','Uber Health') THEN COALESCE(q.qa_sum, 0)
             when o.line_of_business in('Diamond Rider') then  COALESCE(q.qa_sum, 0)
             WHEN o.line_of_business IN('Driver C360','Rider C360') THEN COALESCE(q.qa_sum, 0)
@@ -1394,7 +1404,7 @@ SELECT DISTINCT
             when o.line_of_business in('UGO Specialized') then coalesce(q.qa_sum, 0)
             ELSE 0 END AS qa_1_n
         ,CASE
-            WHEN o.line_of_business IN('SAFE: FP', 'SAFE: Triage', 'SAFE: RRT','HiPo SORT') THEN COALESCE(q.qa_count, 0)
+            WHEN o.line_of_business IN('SAFE: FP', 'SAFE: Triage', 'SAFE: RRT','HiPo SORT','ECR') THEN COALESCE(q.qa_count, 0)
             WHEN o.line_of_business IN('Driver Payment - Phone','Driver Phone Escalations','Uber Health') THEN COALESCE(q.qa_count, 0)
             when o.line_of_business in('Diamond Rider') then  COALESCE(q.qa_count, 0)
             WHEN o.line_of_business IN('Driver C360','Rider C360') THEN COALESCE(q.qa_count, 0)
